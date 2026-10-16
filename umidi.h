@@ -470,20 +470,23 @@ static long UMidiUnhookMidisys(void) {
 	return 0;
 }
 
-/* Silence every channel through the XBIOS, which never writes the ACIA
- * control register. A status byte aborts a possibly half-transmitted
- * message, so the stream stays parseable. */
+/* Silence every channel and reset its controllers through the XBIOS,
+ * which never writes the ACIA control register. A status byte aborts a
+ * possibly half-transmitted message, so the stream stays parseable. */
 static void UMidiSilence(void) {
-	uint8_t msg[16 * 6];
+	uint8_t msg[16 * 9];
 	int i;
 
 	for (i = 0; i < 16; ++i) {
-		msg[i * 6 + 0] = 0xb0 | i;
-		msg[i * 6 + 1] = 0x78;	/* All Sound Off */
-		msg[i * 6 + 2] = 0x00;
-		msg[i * 6 + 3] = 0xb0 | i;
-		msg[i * 6 + 4] = 0x7b;	/* All Notes Off */
-		msg[i * 6 + 5] = 0x00;
+		msg[i * 9 + 0] = 0xb0 | i;
+		msg[i * 9 + 1] = 0x78;	/* All Sound Off */
+		msg[i * 9 + 2] = 0x00;
+		msg[i * 9 + 3] = 0xb0 | i;
+		msg[i * 9 + 4] = 0x7b;	/* All Notes Off */
+		msg[i * 9 + 5] = 0x00;
+		msg[i * 9 + 6] = 0xb0 | i;
+		msg[i * 9 + 7] = 0x79;	/* Reset All Controllers */
+		msg[i * 9 + 8] = 0x00;
 	}
 	Midiws(sizeof(msg) - 1, msg);
 }
