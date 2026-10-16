@@ -22,6 +22,8 @@
 #ifndef UMIDI_H
 #define UMIDI_H
 
+#define UMIDI_VERSION 1
+
 #include "SDL_config.h"
 
 #ifdef __MINT__
@@ -36,8 +38,8 @@
 #include "native_midi.h"
 #include "native_midi_common.h"
 
-#define FIFO_SIZE		2048		/* power of two */
-#define FIFO_MASK		(FIFO_SIZE - 1)
+#define UMIDI_FIFO_SIZE			2048		/* power of two */
+#define UMIDI_FIFO_MASK			(UMIDI_FIFO_SIZE - 1)
 
 struct _NativeMidiSong {
 	MIDIEvent *firstEvent;
@@ -59,7 +61,7 @@ static Uint32 s_tickAdd;
 static Uint32 s_tickFrac;
 static Uint32 s_tickInt;
 
-static Uint8 s_fifo[FIFO_SIZE];
+static Uint8 s_fifo[UMIDI_FIFO_SIZE];
 static volatile Uint16 s_fifoHead, s_fifoTail;
 
 static Uint8 s_lastCC7[16];			/* channel volume as sent by the song */
@@ -72,6 +74,15 @@ static _KBDVECS *s_kbdvecs;
 static Uint32 s_oldTimerbVec;
 static Uint8 s_oldTbcr;
 static SDL_bool s_oldTimerbEnabled, s_oldTimerbMasked;
+
+#ifndef UMIDI_DEF
+#ifdef __GNUC__
+/* a translation unit doesn't have to use all of them */
+#define UMIDI_DEF	static __attribute__((__unused__))
+#else
+#define UMIDI_DEF	static
+#endif
+#endif	/* UMIDI_DEF */
 
 /******************************************************************************/
 
@@ -109,36 +120,36 @@ static SDL_bool s_oldTimerbEnabled, s_oldTimerbMasked;
  * controller 7 messages with the recomputed values for all 16 channels.
  */
 
-#define MIDI_ACIA_CTRL	(*(volatile Uint8 *)0xFFFFFC04L)
-#define MIDI_ACIA_DATA	(*(volatile Uint8 *)0xFFFFFC06L)
-#define ACIA_TDRE		(1 << 1)
+#define UMIDI_ACIA_CTRL			(*(volatile Uint8 *)0xFFFFFC04L)	/* MIDI ACIA control (write) and status (read) register */
+#define UMIDI_ACIA_DATA			(*(volatile Uint8 *)0xFFFFFC06L)	/* MIDI ACIA data register */
+#define UMIDI_ACIA_TDRE			(1 << 1)							/* ACIA status: transmit data register empty */
 
 /* /16 clock, 8N1, RTS low, TX interrupt off, RX interrupt on.*/
-#define ACIA_CTRL_TIE_OFF	0x95
+#define UMIDI_ACIA_CTRL_TIE_OFF	0x95
 /* /16 clock, 8N1, RTS low, TX interrupt on, RX interrupt on.*/
-#define ACIA_CTRL_TIE_ON	0xB5
+#define UMIDI_ACIA_CTRL_TIE_ON	0xB5
 
-#define MFP_IERA		(*(volatile Uint8 *)0xFFFFFA07L)
-#define MFP_IPRA		(*(volatile Uint8 *)0xFFFFFA0BL)
-#define MFP_ISRA		(*(volatile Uint8 *)0xFFFFFA0FL)
-#define MFP_IMRA		(*(volatile Uint8 *)0xFFFFFA13L)
-#define MFP_TBCR		(*(volatile Uint8 *)0xFFFFFA1BL)
+#define UMIDI_MFP_IERA			(*(volatile Uint8 *)0xFFFFFA07L)	/* MFP interrupt enable register A */
+#define UMIDI_MFP_IPRA			(*(volatile Uint8 *)0xFFFFFA0BL)	/* MFP interrupt pending register A */
+#define UMIDI_MFP_ISRA			(*(volatile Uint8 *)0xFFFFFA0FL)	/* MFP interrupt in-service register A */
+#define UMIDI_MFP_IMRA			(*(volatile Uint8 *)0xFFFFFA13L)	/* MFP interrupt mask register A */
+#define UMIDI_MFP_TBCR			(*(volatile Uint8 *)0xFFFFFA1BL)	/* MFP Timer B control register */
 
-#define MFP_CLOCK		2457600UL
-#define TIMER_B_CTRL	3		/* prescaler /16 */
-#define TIMER_B_PRESCALER 16
-#define TIMER_B_DATA	160		/* 2457600/16/160 = 960 Hz */
+#define UMIDI_MFP_CLOCK			2457600UL
+#define UMIDI_TIMER_B_CTRL		3		/* prescaler /16 */
+#define UMIDI_TIMER_B_PRESCALER	16
+#define UMIDI_TIMER_B_DATA		160		/* 2457600/16/160 = 960 Hz */
 
-#define TICK_NUMER		((Uint32)((65536ULL \
-									* TIMER_B_PRESCALER \
-									* TIMER_B_DATA \
+#define UMIDI_TICK_NUMER		((Uint32)((65536ULL \
+									* UMIDI_TIMER_B_PRESCALER \
+									* UMIDI_TIMER_B_DATA \
 									* 1000000 \
-									+ MFP_CLOCK/2) / MFP_CLOCK))
+									+ UMIDI_MFP_CLOCK/2) / UMIDI_MFP_CLOCK))
 
-#define DEFAULT_TEMPO	500000UL	/* us per quarter note (120 bpm) */
-#define DEFAULT_CC7		100			/* GM default channel volume */
+#define UMIDI_DEFAULT_TEMPO		500000UL	/* us per quarter note (120 bpm) */
+#define UMIDI_DEFAULT_CC7		100			/* GM default channel volume */
 
-static __inline__ Uint16 set_ipl7(void) {
+static __inline__ Uint16 UMidiDisableInterrupts(void) {
 	Uint16 sr;
 #ifdef __mcoldfire__
 	/* ColdFire has no ori to SR; this runs in supervisor mode, so
@@ -150,37 +161,37 @@ static __inline__ Uint16 set_ipl7(void) {
 	return sr;
 }
 
-static __inline__ void restore_ipl(Uint16 sr) {
+static __inline__ void UMidiRestoreInterrupts(Uint16 sr) {
 	__asm__ volatile ("move.w %0,%%sr" : : "d"(sr) : "memory");
 }
 
-static __inline__ Uint8 scaled_cc7(Uint8 chan) {
+static __inline__ Uint8 UMidiScaledVolume(Uint8 chan) {
 	return (Uint16)(s_lastCC7[chan] * s_volume) / MIX_MAX_VOLUME;
 }
 
-static __inline__ Uint16 fifo_space(void) {
-	return FIFO_SIZE - 1 - ((s_fifoHead - s_fifoTail) & FIFO_MASK);
+static __inline__ Uint16 UMidiFifoSpace(void) {
+	return UMIDI_FIFO_SIZE - 1 - ((s_fifoHead - s_fifoTail) & UMIDI_FIFO_MASK);
 }
 
-static __inline__ void fifo_push(Uint8 b) {
+static __inline__ void UMidiFifoPush(Uint8 b) {
 	s_fifo[s_fifoHead] = b;
-	s_fifoHead = (s_fifoHead + 1) & FIFO_MASK;
+	s_fifoHead = (s_fifoHead + 1) & UMIDI_FIFO_MASK;
 }
 
 /* Returns how many MIDI ticks elapse during one timer period, as 16.16
  * fixed point: 65536 * ticksPerQuarterNote * period_us / tempo_us. */
-static __inline__ Uint32 midi_ticks_per_period(Uint32 tempo) {
+static __inline__ Uint32 UMidiTicksPerPeriod(Uint32 tempo) {
 	Uint32 q, r;
 
-	q = TICK_NUMER / tempo;
-	r = TICK_NUMER % tempo;
+	q = UMIDI_TICK_NUMER / tempo;
+	r = UMIDI_TICK_NUMER % tempo;
 
 	return s_ticksPerQuarterNote * q
 		+ (s_ticksPerQuarterNote * r + tempo / 2) / tempo;
 }
 
 /* Producer: schedule due events into the FIFO, arm the ACIA TX interrupt */
-static void __attribute__((interrupt)) timer_b(void) {
+static void __attribute__((interrupt)) UMidiTimerHandler(void) {
 	MIDIEvent *ev;
 
 	/* advance song position */
@@ -201,22 +212,22 @@ static void __attribute__((interrupt)) timer_b(void) {
 							| ((Uint32)ev->extraData[1] << 8)
 							| (Uint32)ev->extraData[2];
 				if (tempo)
-					s_tickAdd = midi_ticks_per_period(tempo);
+					s_tickAdd = UMidiTicksPerPeriod(tempo);
 			}
 			/* 0x2f (end of track) and the rest are ignored;
 			 * end of song == end of the event list */
 		} else {
 			switch (status >> 4) {
 				case MIDI_STATUS_CONTROLLER:
-					if (fifo_space() < 3)
+					if (UMidiFifoSpace() < 3)
 						goto fifo_full;
 					if (ev->data[0] == 0x07) {
 						/* Channel volume: remember it and send it scaled
 						 * by the master volume */
 						s_lastCC7[status & 0x0f] = ev->data[1];
-						fifo_push(status);
-						fifo_push(0x07);
-						fifo_push(scaled_cc7(status & 0x0f));
+						UMidiFifoPush(status);
+						UMidiFifoPush(0x07);
+						UMidiFifoPush(UMidiScaledVolume(status & 0x0f));
 						break;
 					}
 					/* fall through */
@@ -224,19 +235,19 @@ static void __attribute__((interrupt)) timer_b(void) {
 				case MIDI_STATUS_NOTE_ON:
 				case MIDI_STATUS_AFTERTOUCH:
 				case MIDI_STATUS_PITCH_WHEEL:
-					if (fifo_space() < 3)
+					if (UMidiFifoSpace() < 3)
 						goto fifo_full;
-					fifo_push(status);
-					fifo_push(ev->data[0]);
-					fifo_push(ev->data[1]);
+					UMidiFifoPush(status);
+					UMidiFifoPush(ev->data[0]);
+					UMidiFifoPush(ev->data[1]);
 					break;
 
 				case MIDI_STATUS_PROG_CHANGE:
 				case MIDI_STATUS_PRESSURE:
-					if (fifo_space() < 2)
+					if (UMidiFifoSpace() < 2)
 						goto fifo_full;
-					fifo_push(status);
-					fifo_push(ev->data[0]);
+					UMidiFifoPush(status);
+					UMidiFifoPush(ev->data[0]);
 					break;
 
 				default:
@@ -255,20 +266,20 @@ fifo_full:
 			s_loops--;
 
 		s_events	= s_currentSong->firstEvent;
-		s_tickAdd	= midi_ticks_per_period(DEFAULT_TEMPO);
+		s_tickAdd	= UMidiTicksPerPeriod(UMIDI_DEFAULT_TEMPO);
 		s_tickFrac	= 0;
 		s_tickInt	= 0;
 	}
 
 	/* Master volume change: resend the scaled channel volumes */
-	if (s_volDirty && fifo_space() >= 16 * 3) {
+	if (s_volDirty && UMidiFifoSpace() >= 16 * 3) {
 		int i;
 
 		s_volDirty = SDL_FALSE;
 		for (i = 0; i < 16; ++i) {
-			fifo_push(0xb0 | i);
-			fifo_push(0x07);
-			fifo_push(scaled_cc7(i));
+			UMidiFifoPush(0xb0 | i);
+			UMidiFifoPush(0x07);
+			UMidiFifoPush(UMidiScaledVolume(i));
 		}
 	}
 
@@ -277,40 +288,42 @@ fifo_full:
 	 * GPIP I4), so transmission starts right after we return. */
 	if (s_fifoHead != s_fifoTail && !s_tie) {
 		s_tie = SDL_TRUE;
-		MIDI_ACIA_CTRL = ACIA_CTRL_TIE_ON;
+		UMIDI_ACIA_CTRL = UMIDI_ACIA_CTRL_TIE_ON;
 	}
 
-	MFP_ISRA = ~(1 << 0);	/* clear in service bit */
+	UMIDI_MFP_ISRA = ~(1 << 0);	/* clear in service bit */
 }
 
 /* private SDL API (src/video/ataricommon/SDL_atarixbra.c) */
-typedef void (*XbraHandler)(void);
-extern XbraHandler Atari_UnhookXbra(Uint32 vecnum, Uint32 app_id, XbraHandler handler);
+typedef void (*UMidiXbraHandler)(void);
+extern UMidiXbraHandler Atari_UnhookXbra(Uint32 vecnum, Uint32 app_id, UMidiXbraHandler handler);
 
-#define XBRA_APP_ID		0x4C53444DUL	/* 'LSDM' */
+#define UMIDI_XBRA_ID			0x4C53444DUL	/* 'LSDM' */
 
-extern void midisys_handler(void);
-extern XbraHandler midisys_oldvec;
+extern void UMidiSysHandler(void);
+extern UMidiXbraHandler UMidiSysOldVec;
 
 /* kb_midisys hook: called (jsr, supervisor) by the TOS $118 handler on
  * every ACIA interrupt, in a loop until the interrupt line is released.
  * Send one byte per TDRE, disarm TIE the moment the FIFO runs dry --
  * leaving TIE armed with nothing to send would hang the midikey loop. */
-void midi_acia_hook(void) {
-	if (s_tie && (MIDI_ACIA_CTRL & ACIA_TDRE)) {
+void UMidiAciaHook(void) {
+	if (s_tie && (UMIDI_ACIA_CTRL & UMIDI_ACIA_TDRE)) {
 		if (s_fifoHead != s_fifoTail) {
-			MIDI_ACIA_DATA = s_fifo[s_fifoTail];
-			s_fifoTail = (s_fifoTail + 1) & FIFO_MASK;
+			UMIDI_ACIA_DATA = s_fifo[s_fifoTail];
+			s_fifoTail = (s_fifoTail + 1) & UMIDI_FIFO_MASK;
 		} else {
-			MIDI_ACIA_CTRL = ACIA_CTRL_TIE_OFF;
+			/* nothing to send: disable the ACIA transmit interrupt,
+			 * UMidiTimerHandler() enables it again */
+			UMIDI_ACIA_CTRL = UMIDI_ACIA_CTRL_TIE_OFF;
 			s_tie = SDL_FALSE;
 		}
 	}
 }
 
-#define STR_(x)			#x
-#define STR(x)			STR_(x)
-#define SYM(x)			STR(__USER_LABEL_PREFIX__) #x
+#define UMIDI_STR_(x)			#x
+#define UMIDI_STR(x)			UMIDI_STR_(x)
+#define UMIDI_SYM(x)			UMIDI_STR(__USER_LABEL_PREFIX__) #x
 
 /*
  * kb_midisys entry with an XBRA header: calls the C handler for the
@@ -325,80 +338,80 @@ void midi_acia_hook(void) {
 __asm__(
 	"\n" "	.pushsection	.text"
 	"\n" "	.even"
-	"\n" "	.globl	" SYM(midisys_oldvec)
-	"\n" "	.globl	" SYM(midisys_handler)
+	"\n" "	.globl	" UMIDI_SYM(UMidiSysOldVec)
+	"\n" "	.globl	" UMIDI_SYM(UMidiSysHandler)
 	"\n" "	.ascii	\"XBRA\""
 	"\n" "	.ascii	\"LSDM\""
-	"\n" SYM(midisys_oldvec) ":"
+	"\n" UMIDI_SYM(UMidiSysOldVec) ":"
 	"\n" "	.long	0"
-	"\n" SYM(midisys_handler) ":"
-	"\n" "	jsr		" SYM(midi_acia_hook)
-	"\n" "	move.l	" SYM(midisys_oldvec) ",%a0"
+	"\n" UMIDI_SYM(UMidiSysHandler) ":"
+	"\n" "	jsr		" UMIDI_SYM(UMidiAciaHook)
+	"\n" "	move.l	" UMIDI_SYM(UMidiSysOldVec) ",%a0"
 	"\n" "	jmp		(%a0)"
 	"\n" "	.popsection"
 	"\n");
 
-static long hook_install(void) {
-	Uint16 sr = set_ipl7();
+static long UMidiInstallHooks(void) {
+	Uint16 sr = UMidiDisableInterrupts();
 
-	s_oldTbcr = MFP_TBCR;
-	s_oldTimerbEnabled	= (MFP_IERA & (1 << 0)) != 0;
-	s_oldTimerbMasked	= (MFP_IMRA & (1 << 0)) != 0;
+	s_oldTbcr = UMIDI_MFP_TBCR;
+	s_oldTimerbEnabled	= (UMIDI_MFP_IERA & (1 << 0)) != 0;
+	s_oldTimerbMasked	= (UMIDI_MFP_IMRA & (1 << 0)) != 0;
 
 	s_tie = SDL_FALSE;
-	MIDI_ACIA_CTRL = ACIA_CTRL_TIE_OFF;
+	UMIDI_ACIA_CTRL = UMIDI_ACIA_CTRL_TIE_OFF;
 
-	if ((XbraHandler)s_kbdvecs->midisys != midisys_handler) {
-		midisys_oldvec = (XbraHandler)s_kbdvecs->midisys;
-		s_kbdvecs->midisys = (long (*)(void))midisys_handler;
+	if ((UMidiXbraHandler)s_kbdvecs->midisys != UMidiSysHandler) {
+		UMidiSysOldVec = (UMidiXbraHandler)s_kbdvecs->midisys;
+		s_kbdvecs->midisys = (long (*)(void))UMidiSysHandler;
 	}
 
-	restore_ipl(sr);
+	UMidiRestoreInterrupts(sr);
 
 	return 0;
 }
 
-static void acia_send(Uint8 b) {
-	while ((MIDI_ACIA_CTRL & ACIA_TDRE) == 0)
+static void UMidiSendPolled(Uint8 b) {
+	while ((UMIDI_ACIA_CTRL & UMIDI_ACIA_TDRE) == 0)
 		;
-	MIDI_ACIA_DATA = b;
+	UMIDI_ACIA_DATA = b;
 }
 
-static long hook_remove(void) {
+static long UMidiRemoveHooks(void) {
 	Uint16 sr;
 	int i;
 
 	/* order matters: hardware TIE off first, only then the shadow */
-	sr = set_ipl7();
-	MIDI_ACIA_CTRL = ACIA_CTRL_TIE_OFF;
+	sr = UMidiDisableInterrupts();
+	UMIDI_ACIA_CTRL = UMIDI_ACIA_CTRL_TIE_OFF;
 	s_tie = SDL_FALSE;
-	restore_ipl(sr);
+	UMidiRestoreInterrupts(sr);
 
 	/* Silence every channel (TIE is off, so polled sending cannot race
 	 * the consumer; interrupts stay enabled, this takes ~30 ms).
 	 * A status byte aborts a possibly
 	 * half-transmitted message, so the stream stays parseable. */
 	for (i = 0; i < 16; ++i) {
-		acia_send(0xb0 | i);
-		acia_send(0x78);	/* All Sound Off */
-		acia_send(0x00);
-		acia_send(0xb0 | i);
-		acia_send(0x7b);	/* All Notes Off */
-		acia_send(0x00);
+		UMidiSendPolled(0xb0 | i);
+		UMidiSendPolled(0x78);	/* All Sound Off */
+		UMidiSendPolled(0x00);
+		UMidiSendPolled(0xb0 | i);
+		UMidiSendPolled(0x7b);	/* All Notes Off */
+		UMidiSendPolled(0x00);
 	}
 
-	sr = set_ipl7();
+	sr = UMidiDisableInterrupts();
 
-	Atari_UnhookXbra((Uint32)&s_kbdvecs->midisys, XBRA_APP_ID, midisys_handler);
+	Atari_UnhookXbra((Uint32)&s_kbdvecs->midisys, UMIDI_XBRA_ID, UMidiSysHandler);
 
-	MFP_TBCR = s_oldTbcr;
-	MFP_IPRA = (Uint8)~(1 << 0);	/* discard a pending tick of ours */
+	UMIDI_MFP_TBCR = s_oldTbcr;
+	UMIDI_MFP_IPRA = (Uint8)~(1 << 0);	/* discard a pending tick of ours */
 	if (s_oldTimerbEnabled)
-		MFP_IERA |= 1 << 0;
+		UMIDI_MFP_IERA |= 1 << 0;
 	if (s_oldTimerbMasked)
-		MFP_IMRA |= 1 << 0;
+		UMIDI_MFP_IMRA |= 1 << 0;
 
-	restore_ipl(sr);
+	UMidiRestoreInterrupts(sr);
 
 	return 0;
 }
@@ -414,17 +427,17 @@ void native_midi_start(NativeMidiSong *song, int loops) {
 	s_events = song->firstEvent;
 	s_ticksPerQuarterNote = song->ticksPerQuarterNote;
 
-	s_tickAdd		= midi_ticks_per_period(DEFAULT_TEMPO);
+	s_tickAdd		= UMidiTicksPerPeriod(UMIDI_DEFAULT_TEMPO);
 	s_tickFrac		= 0;
 	s_tickInt		= 0;
 	s_fifoHead		= s_fifoTail = 0;
 
 	for (i = 0; i < 16; ++i)
-		s_lastCC7[i] = DEFAULT_CC7;
+		s_lastCC7[i] = UMIDI_DEFAULT_CC7;
 	s_volDirty = SDL_TRUE;		/* apply the master volume from the start */
 
 	s_kbdvecs = Kbdvbase();
-	Supexec(hook_install);
+	Supexec(UMidiInstallHooks);
 
 	s_loops = loops;	/* number of repeats after the first pass; -1 = forever */
 
@@ -432,7 +445,7 @@ void native_midi_start(NativeMidiSong *song, int loops) {
 
 	Jdisint(MFP_TIMERB);
 	s_oldTimerbVec = (Uint32)Setexc(0x120>>2, -1);
-	Xbtimer(XB_TIMERB, TIMER_B_CTRL, TIMER_B_DATA, timer_b);
+	Xbtimer(XB_TIMERB, UMIDI_TIMER_B_CTRL, UMIDI_TIMER_B_DATA, UMidiTimerHandler);
 }
 
 void native_midi_stop() {
@@ -445,7 +458,7 @@ void native_midi_stop() {
 	}
 
 	if (s_kbdvecs)
-		Supexec(hook_remove);
+		Supexec(UMidiRemoveHooks);
 
 	s_currentSong = NULL;
 }
