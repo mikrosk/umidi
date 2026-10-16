@@ -29,6 +29,7 @@
 #ifdef __MINT__
 
 #include <stdlib.h>
+#include <string.h>
 
 #include <mint/osbind.h>
 #include <mint/ostruct.h>
@@ -50,7 +51,7 @@ typedef struct {
 	/* Only one song plays at a time; the playback state lives here and not
 	 * in NativeMidiSong. */
 	NativeMidiSong * volatile currentSong;	/* NULL when stopped */
-	MIDIEvent *events;						/* next event to schedule */
+	MIDIEvent * volatile events;			/* next event to schedule */
 	Uint32 ticksPerQuarterNote;
 	int loops;
 
@@ -67,7 +68,7 @@ typedef struct {
 
 	Uint8 lastCC7[16];				/* channel volume as sent by the song */
 	volatile Uint8 volume;			/* master volume */
-	volatile SDL_bool volDirty;		/* set by native_midi_setvolume(), consumed by the producer */
+	volatile SDL_bool volDirty;		/* set by UMidiSetVolume(), consumed by the producer */
 
 	volatile SDL_bool tie;			/* shadow: is the TX interrupt enabled? */
 	_KBDVECS *kbdvecs;
@@ -85,6 +86,13 @@ typedef struct {
 #define UMIDI_DEF	static
 #endif
 #endif	/* UMIDI_DEF */
+
+UMIDI_DEF int UMidiOpen(UMidiContext* ctx);
+UMIDI_DEF void UMidiClose(UMidiContext* ctx);
+UMIDI_DEF void UMidiPlay(UMidiContext* ctx, NativeMidiSong* song, int loops);
+UMIDI_DEF void UMidiStop(UMidiContext* ctx);
+UMIDI_DEF int UMidiIsPlaying(const UMidiContext* ctx);
+UMIDI_DEF void UMidiSetVolume(UMidiContext* ctx, int volume);
 
 /******************************************************************************/
 
@@ -113,11 +121,10 @@ typedef struct {
  *    always either sends a byte or turns TIE off before returning.
  *
  * Volume: a MIDI song controls 16 channel volumes (controller 7) but
- * the wire has no master volume, so native_midi_setvolume() (called
- * from music.c for Mix_VolumeMusic() and for fades) implements one by
+ * the wire has no master volume, so UMidiSetVolume() implements one by
  * scaling. lastCC7[] holds each channel volume as the song last set
  * it: the producer updates it from controller 7 events and transmits
- * lastCC7[channel] * volume / MIX_MAX_VOLUME. native_midi_setvolume()
+ * lastCC7[channel] * volume / MIX_MAX_VOLUME. UMidiSetVolume()
  * stores volume, sets volDirty and returns; the producer then queues
  * controller 7 messages with the recomputed values for all 16 channels.
  */
@@ -426,16 +433,23 @@ static long UMidiRemoveHooks(void) {
 	return 0;
 }
 
-static UMidiContext s_ctx = { .volume = MIX_MAX_VOLUME };
+UMIDI_DEF int UMidiOpen(UMidiContext* ctx) {
+	memset(ctx, 0, sizeof(*ctx));
+	ctx->volume = MIX_MAX_VOLUME;
 
-void native_midi_start(NativeMidiSong *song, int loops) {
-	UMidiContext *ctx = &s_ctx;
+	return 1;
+}
+
+UMIDI_DEF void UMidiClose(UMidiContext* ctx) {
+	if (ctx->currentSong)
+		UMidiStop(ctx);
+}
+
+UMIDI_DEF void UMidiPlay(UMidiContext* ctx, NativeMidiSong* song, int loops) {
 	int i;
 
-	printf("%s: %d\n", __FUNCTION__, loops);
-
 	if (ctx->currentSong)
-		native_midi_stop();
+		UMidiStop(ctx);
 
 	ctx->events = song->firstEvent;
 	ctx->ticksPerQuarterNote = song->ticksPerQuarterNote;
@@ -447,7 +461,6 @@ void native_midi_start(NativeMidiSong *song, int loops) {
 
 	for (i = 0; i < 16; ++i)
 		ctx->lastCC7[i] = UMIDI_DEFAULT_CC7;
-	ctx->volDirty = SDL_TRUE;	/* apply the master volume from the start */
 
 	ctx->kbdvecs = Kbdvbase();
 	UMidiActiveContext = ctx;
@@ -462,11 +475,7 @@ void native_midi_start(NativeMidiSong *song, int loops) {
 	Xbtimer(XB_TIMERB, UMIDI_TIMER_B_CTRL, UMIDI_TIMER_B_DATA, UMidiTimerHandler);
 }
 
-void native_midi_stop() {
-	UMidiContext *ctx = &s_ctx;
-
-	printf("%s\n", __FUNCTION__);
-
+UMIDI_DEF void UMidiStop(UMidiContext* ctx) {
 	Jdisint(MFP_TIMERB);
 	if (ctx->oldTimerbVec) {
 		(void)Setexc(0x120>>2, ctx->oldTimerbVec);
@@ -479,18 +488,12 @@ void native_midi_stop() {
 	ctx->currentSong = NULL;
 }
 
-int native_midi_active() {
-	UMidiContext *ctx = &s_ctx;
-
+UMIDI_DEF int UMidiIsPlaying(const UMidiContext* ctx) {
 	return ctx->currentSong != NULL
 		&& (ctx->events || ctx->fifoHead != ctx->fifoTail);
 }
 
-void native_midi_setvolume(int volume) {
-	UMidiContext *ctx = &s_ctx;
-
-	printf("%s: %d\n", __FUNCTION__, volume);
-
+UMIDI_DEF void UMidiSetVolume(UMidiContext* ctx, int volume) {
 	if (volume < 0)
 		volume = 0;
 	else if (volume > MIX_MAX_VOLUME)
@@ -500,8 +503,35 @@ void native_midi_setvolume(int volume) {
 	ctx->volDirty = SDL_TRUE;
 }
 
+static UMidiContext s_ctx;
+static int s_volume = MIX_MAX_VOLUME;
+
+void native_midi_start(NativeMidiSong *song, int loops) {
+	printf("%s: %d\n", __FUNCTION__, loops);
+
+	UMidiSetVolume(&s_ctx, s_volume);
+	UMidiPlay(&s_ctx, song, loops);
+}
+
+void native_midi_stop() {
+	printf("%s\n", __FUNCTION__);
+
+	UMidiStop(&s_ctx);
+}
+
+int native_midi_active() {
+	return UMidiIsPlaying(&s_ctx);
+}
+
+void native_midi_setvolume(int volume) {
+	printf("%s: %d\n", __FUNCTION__, volume);
+
+	s_volume = volume;
+	UMidiSetVolume(&s_ctx, volume);
+}
+
 int native_midi_detect() {
-	return 1;	/* always available */
+	return UMidiOpen(&s_ctx);	/* always available */
 }
 
 NativeMidiSong *native_midi_loadsong_RW(SDL_RWops *rw, int freerw) {
