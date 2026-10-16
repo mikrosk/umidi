@@ -24,24 +24,13 @@
 
 #define UMIDI_VERSION 1
 
-#include "SDL_config.h"
-
-#ifdef __MINT__
-
-#include <stdint.h>
-#include <stdlib.h>
-#include <string.h>
-
 #include <mint/osbind.h>
 #include <mint/ostruct.h>
-
-#include "../SDL_mixer.h"
-
-#include "native_midi.h"
-#include "native_midi_common.h"
+#include <stdint.h>
+#include <string.h>
 
 /* highest volume for UMidiSetVolume() */
-#define UMIDI_MAX_VOLUME 128
+#define UMIDI_MAX_VOLUME 127
 
 #define UMIDI_FIFO_SIZE			2048		/* power of two */
 #define UMIDI_FIFO_MASK			(UMIDI_FIFO_SIZE - 1)
@@ -189,7 +178,6 @@ UMIDI_DEF void UMidiUnlock(UMidiContext* ctx);
 #error "UMIDI_TICK_MUL / UMIDI_TICK_DIV don't match the Timer B rate"
 #endif
 
-#define UMIDI_DEFAULT_TEMPO		500000UL	/* us per quarter note (120 bpm) */
 #define UMIDI_DEFAULT_CC7		100			/* GM default channel volume */
 #define UMIDI_TICK_RESERVE		128			/* free FIFO bytes before a tick is processed, so its messages fit */
 
@@ -677,179 +665,5 @@ UMIDI_DEF void UMidiLock(UMidiContext* ctx) {
 UMIDI_DEF void UMidiUnlock(UMidiContext* ctx) {
 	--ctx->locked;
 }
-
-struct _NativeMidiSong {
-	UMidiSong song;
-};
-
-static UMidiContext s_ctx;
-static int s_volume = MIX_MAX_VOLUME;
-
-/* Builds the blocks of a song from SDL_mixer's event list: channel
- * messages only, their tick times turned into microseconds with the tempo
- * changes applied. An empty block at the time of the last event (end of
- * track) keeps the length of the song. */
-static int native_midi_convert(UMidiSong *song, const MIDIEvent *events, Uint16 division) {
-	const MIDIEvent *ev;
-	UMidiBlock *blocks;
-	uint8_t *data;
-	uint32_t numEvents = 0, numBlocks = 0, size = 0;
-	uint32_t tick = 0, time = 0, rem = 0;
-	uint32_t usPerTick, usRem;
-
-	if (!division)
-		return 0;
-
-	for (ev = events; ev; ev = ev->next)
-		numEvents++;
-
-	/* at most one block per event plus the end of track, at most three
-	 * bytes per event */
-	blocks = (UMidiBlock *)malloc((numEvents + 1) * sizeof(*blocks));
-	data = (uint8_t *)malloc(numEvents * 3 + 1);
-	if (!blocks || !data) {
-		free(blocks);
-		free(data);
-		return 0;
-	}
-
-	usPerTick = UMIDI_DEFAULT_TEMPO / division;
-	usRem = UMIDI_DEFAULT_TEMPO % division;
-
-	for (ev = events; ev; ev = ev->next) {
-		const uint8_t status = ev->status;
-		const uint32_t delta = ev->time - tick;
-		uint32_t length;
-
-		/* ticks to microseconds; the remainder carries over, so no
-		 * rounding error accumulates, and stays below division squared */
-		tick = ev->time;
-		time += delta * usPerTick + delta / division * usRem;
-		rem += delta % division * usRem;
-		if (rem >= division) {
-			time += rem / division;
-			rem %= division;
-		}
-
-		if (status == 0xff) {
-			/* meta event: only a tempo change matters */
-			if (ev->data[0] == 0x51 && ev->extraLen == 3) {
-				uint32_t tempo = ((uint32_t)ev->extraData[0] << 16)
-					| ((uint32_t)ev->extraData[1] << 8)
-					| (uint32_t)ev->extraData[2];
-				if (tempo) {
-					usPerTick = tempo / division;
-					usRem = tempo % division;
-				}
-			}
-			continue;
-		}
-		if (status >= 0xf0)
-			continue;	/* system exclusive: skipped */
-
-		if (numBlocks == 0 || time != blocks[numBlocks - 1].time) {
-			blocks[numBlocks].time = time;
-			numBlocks++;
-		}
-
-		length = ((status & 0xf0) == 0xc0 || (status & 0xf0) == 0xd0) ? 2 : 3;
-		data[size] = status;
-		data[size + 1] = ev->data[0];
-		if (length == 3)
-			data[size + 2] = ev->data[1];
-		size += length;
-		blocks[numBlocks - 1].end = size;
-	}
-
-	if (numBlocks == 0 || time != blocks[numBlocks - 1].time) {
-		blocks[numBlocks].time = time;
-		blocks[numBlocks].end = size;
-		numBlocks++;
-	}
-
-	song->blocks = blocks;
-	song->data = data;
-	song->numBlocks = numBlocks;
-	song->loopBlock = 0;
-
-	return 1;
-}
-
-void native_midi_start(NativeMidiSong *song, int loops) {
-	printf("%s: %d\n", __FUNCTION__, loops);
-
-	UMidiClose(&s_ctx);
-	if (UMidiOpen(&s_ctx)) {
-		UMidiSetVolume(&s_ctx, s_volume);
-		UMidiPlay(&s_ctx, &song->song, loops);
-	}
-}
-
-void native_midi_stop() {
-	printf("%s\n", __FUNCTION__);
-
-	UMidiClose(&s_ctx);
-}
-
-int native_midi_active() {
-	return UMidiIsPlaying(&s_ctx);
-}
-
-void native_midi_setvolume(int volume) {
-	printf("%s: %d\n", __FUNCTION__, volume);
-
-	s_volume = volume;
-	UMidiSetVolume(&s_ctx, volume);
-}
-
-int native_midi_detect() {
-	return 1;	/* always available */
-}
-
-NativeMidiSong *native_midi_loadsong_RW(SDL_RWops *rw, int freerw) {
-	NativeMidiSong *song;
-	MIDIEvent *events;
-	Uint16 division;
-
-	printf("%s\n", __FUNCTION__);
-
-	song = (NativeMidiSong *)malloc(sizeof(*song));
-	if (song) {
-		events = CreateMIDIEventList(rw, &division);
-		if (!events || !native_midi_convert(&song->song, events, division)) {
-			free(song);
-			song = NULL;
-		}
-		if (events)
-			FreeMIDIEventList(events);
-	}
-
-	if (freerw)
-		SDL_RWclose(rw);
-
-	return song;
-}
-
-void native_midi_freesong(NativeMidiSong *song) {
-	UMidiContext *ctx = &s_ctx;
-
-	printf("%s\n", __FUNCTION__);
-
-	if (!song)
-		return;
-
-	if (&song->song == ctx->song)
-		native_midi_stop();
-
-	free((void *)song->song.blocks);
-	free((void *)song->song.data);
-	free(song);
-}
-
-const char *native_midi_error(void) {
-	return "";
-}
-
-#endif	/* __MINT__ */
 
 #endif
