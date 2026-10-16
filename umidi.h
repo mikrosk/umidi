@@ -220,9 +220,27 @@ static __inline__ int UMidiSongEnded(const UMidiContext *ctx) {
 		&& (!ctx->loops || ctx->song->loopBlock >= ctx->song->numBlocks);
 }
 
+/* End of a Timer B interrupt: arm the ACIA TX interrupt for queued bytes,
+ * or disable the Timer B interrupt once there is nothing left to do */
+static __inline__ void UMidiTransmit(UMidiContext *ctx, int idle) {
+	if (ctx->fifoHead != ctx->fifoTail) {
+		/* bytes queued and TX interrupt not armed: arm it. If TDRE is
+		 * already set this asserts the ACIA IRQ at once (falling edge on
+		 * GPIP I4), so transmission starts right after we return. */
+		if (!ctx->tie) {
+			ctx->tie = 1;
+			UMIDI_ACIA_CTRL = UMIDI_ACIA_CTRL_TIE_ON;
+		}
+	} else if (idle) {
+		/* nothing to send and nothing to do: disable the Timer B
+		 * interrupt, starting playback enables it again */
+		UMIDI_MFP_IERA &= (uint8_t)~(1 << 0);
+	}
+}
+
 /* Producer: queue the messages of the due blocks into the FIFO, arm the
  * ACIA TX interrupt */
-static void __attribute__((interrupt)) UMidiTimerHandler(void) {
+static void __attribute__((interrupt)) UMidiPlayerInterrupt(void) {
 	UMidiContext *ctx = UMidiActiveContext;
 	const UMidiSong *song = ctx->song;
 	int looped = 0;
@@ -293,19 +311,7 @@ fifo_full:
 	}
 
 transmit:
-	if (ctx->fifoHead != ctx->fifoTail) {
-		/* bytes queued and TX interrupt not armed: arm it. If TDRE is
-		 * already set this asserts the ACIA IRQ at once (falling edge on
-		 * GPIP I4), so transmission starts right after we return. */
-		if (!ctx->tie) {
-			ctx->tie = 1;
-			UMIDI_ACIA_CTRL = UMIDI_ACIA_CTRL_TIE_ON;
-		}
-	} else if (!ctx->song || UMidiSongEnded(ctx)) {
-		/* nothing to send and no song to play: disable the Timer B
-		 * interrupt, UMidiPlay() enables it again */
-		UMIDI_MFP_IERA &= (uint8_t)~(1 << 0);
-	}
+	UMidiTransmit(ctx, !ctx->song || UMidiSongEnded(ctx));
 
 	UMIDI_MFP_ISRA = ~(1 << 0);	/* clear in service bit */
 }
@@ -349,7 +355,7 @@ static void __attribute__((patchable_function_entry(sizeof(UMidiXbra) / 2, sizeo
 			ctx->fifoTail = (ctx->fifoTail + 1) & UMIDI_FIFO_MASK;
 		} else {
 			/* nothing to send: disable the ACIA transmit interrupt,
-			 * UMidiTimerHandler() enables it again */
+			 * UMidiTransmit() enables it again */
 			UMIDI_ACIA_CTRL = UMIDI_ACIA_CTRL_TIE_OFF;
 			ctx->tie = 0;
 		}
@@ -459,11 +465,9 @@ UMIDI_DEF int UMidiOpen(UMidiContext* ctx) {
 		return 0;
 	}
 
-	/* Timer B through the XBIOS; its interrupt disables itself while there
-	 * is nothing to do */
+	/* Timer B through the XBIOS; playing installs its interrupt */
 	Jdisint(MFP_TIMERB);
 	ctx->oldTimerbVec = (uint32_t)Setexc(0x120>>2, -1);
-	Xbtimer(XB_TIMERB, UMIDI_TIMER_B_CTRL, UMIDI_TIMER_B_DATA, UMidiTimerHandler);
 
 	return 1;
 }
@@ -507,7 +511,7 @@ UMIDI_DEF void UMidiPlay(UMidiContext* ctx, const UMidiSong* song, int loops) {
 	 * timer interrupt checks */
 	__asm__ volatile ("" : : : "memory");
 	ctx->song = song;
-	Jenabint(MFP_TIMERB);
+	Xbtimer(XB_TIMERB, UMIDI_TIMER_B_CTRL, UMIDI_TIMER_B_DATA, UMidiPlayerInterrupt);
 }
 
 UMIDI_DEF void UMidiStop(UMidiContext* ctx) {
