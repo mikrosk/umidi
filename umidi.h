@@ -24,6 +24,7 @@
 
 #define UMIDI_VERSION 1
 
+#include <mint/cookie.h>
 #include <mint/osbind.h>
 #include <mint/ostruct.h>
 #include <stdint.h>
@@ -486,6 +487,8 @@ static void UMidiSilence(void) {
 }
 
 UMIDI_DEF int UMidiOpen(UMidiContext* ctx) {
+	long mch;
+
 	if (ctx == UMidiActiveContext)
 		return 0;	/* already open */
 
@@ -494,6 +497,16 @@ UMIDI_DEF int UMidiOpen(UMidiContext* ctx) {
 
 	if (UMidiActiveContext)
 		return 0;	/* another context is open */
+
+	/* the MIDI ACIA and the MFP at the ST address exist in the ST, STE, TT
+	 * and Falcon (_MCH 0-3), also emulated by ARAnyM (5); the Milan (4)
+	 * has no ACIA and its MFP sits elsewhere */
+	if (Getcookie(C__MCH, &mch) == C_FOUND) {
+		const uint16_t machine = (uint16_t)(mch >> 16);
+
+		if (machine > 5 || machine == 4)
+			return 0;
+	}
 
 	/* kb_midisys has no XBIOS function, it's changed in supervisor mode */
 	ctx->kbdvecs = Kbdvbase();
