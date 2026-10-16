@@ -1,23 +1,27 @@
 /*
-  native_midi:  Hardware Midi support on Atari for the SDL_mixer library
-  Copyright (C) 2026  Miro Kropacek <miro.kropacek@gmail.com>
+ * Copyright 2026 Miro Kropacek <miro.kropacek@gmail.com>
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the “Software”), to deal in
+ * the Software without restriction, including without limitation the rights to
+ * use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of
+ * the Software, and to permit persons to whom the Software is furnished to do so,
+ * subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in all
+ * copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED “AS IS”, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
+ * FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR
+ * COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
+ * IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+ * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+ */
 
-  This software is provided 'as-is', without any express or implied
-  warranty.  In no event will the authors be held liable for any damages
-  arising from the use of this software.
+#ifndef UMIDI_H
+#define UMIDI_H
 
-  Permission is granted to anyone to use this software for any purpose,
-  including commercial applications, and to alter it and redistribute it
-  freely, subject to the following restrictions:
-
-  1. The origin of this software must not be misrepresented; you must not
-     claim that you wrote the original software. If you use this software
-     in a product, an acknowledgment in the product documentation would be
-     appreciated but is not required.
-  2. Altered source versions must be plainly marked as such, and must not be
-     misrepresented as being the original software.
-  3. This notice may not be removed or altered from any source distribution.
-*/
 #include "SDL_config.h"
 
 #ifdef __MINT__
@@ -31,6 +35,45 @@
 
 #include "native_midi.h"
 #include "native_midi_common.h"
+
+#define FIFO_SIZE		2048		/* power of two */
+#define FIFO_MASK		(FIFO_SIZE - 1)
+
+struct _NativeMidiSong {
+	MIDIEvent *firstEvent;
+	Uint16 ticksPerQuarterNote; /* 48 by default (independent of the tempo) */
+};
+
+/* Only one song plays at a time; the playback state lives here and not
+ * in NativeMidiSong. */
+static NativeMidiSong * volatile s_currentSong;	/* NULL when stopped */
+static MIDIEvent *s_events;						/* next event to schedule */
+static Uint32 s_ticksPerQuarterNote;
+static int s_loops;
+
+/* 16.16 fixed point: upper 16 bits integer part, lower 16 bits fraction.
+ * Every timer interrupt executes s_tickFrac += s_tickAdd; whenever
+ * s_tickFrac crosses 1.0, the whole part moves into s_tickInt and only
+ * the fraction stays. */
+static Uint32 s_tickAdd;
+static Uint32 s_tickFrac;
+static Uint32 s_tickInt;
+
+static Uint8 s_fifo[FIFO_SIZE];
+static volatile Uint16 s_fifoHead, s_fifoTail;
+
+static Uint8 s_lastCC7[16];			/* channel volume as sent by the song */
+static volatile Uint8 s_volume = MIX_MAX_VOLUME;	/* master volume */
+static volatile SDL_bool s_volDirty;		/* set by native_midi_setvolume(), consumed by the producer */
+
+static volatile SDL_bool s_tie;		/* shadow: is the TX interrupt enabled? */
+static _KBDVECS *s_kbdvecs;
+
+static Uint32 s_oldTimerbVec;
+static Uint8 s_oldTbcr;
+static SDL_bool s_oldTimerbEnabled, s_oldTimerbMasked;
+
+/******************************************************************************/
 
 /*
  * Two interrupt sources, one FIFO between them:
@@ -94,53 +137,6 @@
 
 #define DEFAULT_TEMPO	500000UL	/* us per quarter note (120 bpm) */
 #define DEFAULT_CC7		100			/* GM default channel volume */
-
-#define FIFO_SIZE		2048		/* power of two */
-#define FIFO_MASK		(FIFO_SIZE - 1)
-
-struct _NativeMidiSong {
-	MIDIEvent *firstEvent;
-	Uint16 ticksPerQuarterNote; /* 48 by default (independent of the tempo) */
-};
-
-/* Only one song plays at a time; the playback state lives here and not
- * in NativeMidiSong. */
-static NativeMidiSong * volatile s_currentSong;	/* NULL when stopped */
-static MIDIEvent *s_events;						/* next event to schedule */
-static Uint32 s_ticksPerQuarterNote;
-static int s_loops;
-
-/* 16.16 fixed point: upper 16 bits integer part, lower 16 bits fraction.
- * Every timer interrupt executes s_tickFrac += s_tickAdd; whenever
- * s_tickFrac crosses 1.0, the whole part moves into s_tickInt and only
- * the fraction stays. */
-static Uint32 s_tickAdd;
-static Uint32 s_tickFrac;
-static Uint32 s_tickInt;
-
-static Uint8 s_fifo[FIFO_SIZE];
-static volatile Uint16 s_fifoHead, s_fifoTail;
-
-static Uint8 s_lastCC7[16];			/* channel volume as sent by the song */
-static volatile Uint8 s_volume = MIX_MAX_VOLUME;	/* master volume */
-static volatile SDL_bool s_volDirty;		/* set by native_midi_setvolume(), consumed by the producer */
-
-static volatile SDL_bool s_tie;		/* shadow: is the TX interrupt enabled? */
-static _KBDVECS *s_kbdvecs;
-
-/* private SDL API (src/video/ataricommon/SDL_atarixbra.c) */
-typedef void (*XbraHandler)(void);
-extern XbraHandler Atari_UnhookXbra(Uint32 vecnum, Uint32 app_id, XbraHandler handler);
-
-#define XBRA_APP_ID		0x4C53444DUL	/* 'LSDM' */
-
-/* native_midi_mint_xbra.S */
-extern void midisys_handler(void);
-extern XbraHandler midisys_oldvec;
-
-static Uint32 s_oldTimerbVec;
-static Uint8 s_oldTbcr;
-static SDL_bool s_oldTimerbEnabled, s_oldTimerbMasked;
 
 static __inline__ Uint16 set_ipl7(void) {
 	Uint16 sr;
@@ -287,6 +283,15 @@ fifo_full:
 	MFP_ISRA = ~(1 << 0);	/* clear in service bit */
 }
 
+/* private SDL API (src/video/ataricommon/SDL_atarixbra.c) */
+typedef void (*XbraHandler)(void);
+extern XbraHandler Atari_UnhookXbra(Uint32 vecnum, Uint32 app_id, XbraHandler handler);
+
+#define XBRA_APP_ID		0x4C53444DUL	/* 'LSDM' */
+
+extern void midisys_handler(void);
+extern XbraHandler midisys_oldvec;
+
 /* kb_midisys hook: called (jsr, supervisor) by the TOS $118 handler on
  * every ACIA interrupt, in a loop until the interrupt line is released.
  * Send one byte per TDRE, disarm TIE the moment the FIFO runs dry --
@@ -302,6 +307,36 @@ void midi_acia_hook(void) {
 		}
 	}
 }
+
+#define STR_(x)			#x
+#define STR(x)			STR_(x)
+#define SYM(x)			STR(__USER_LABEL_PREFIX__) #x
+
+/*
+ * kb_midisys entry with an XBRA header: calls the C handler for the
+ * transmit side, then jumps to the previous vector for the receive
+ * side.
+ *
+ * No specification defines which registers a kbdvecs routine may
+ * clobber, but both Atari TOS and EmuTOS save d0-d3/a0-a3 around these
+ * calls. This handler clobbers only d0-d1/a0-a1 (C call) plus a0
+ * (chain jump), so nothing has to be saved here under either reading.
+ */
+__asm__(
+	"\n" "	.pushsection	.text"
+	"\n" "	.even"
+	"\n" "	.globl	" SYM(midisys_oldvec)
+	"\n" "	.globl	" SYM(midisys_handler)
+	"\n" "	.ascii	\"XBRA\""
+	"\n" "	.ascii	\"LSDM\""
+	"\n" SYM(midisys_oldvec) ":"
+	"\n" "	.long	0"
+	"\n" SYM(midisys_handler) ":"
+	"\n" "	jsr		" SYM(midi_acia_hook)
+	"\n" "	move.l	" SYM(midisys_oldvec) ",%a0"
+	"\n" "	jmp		(%a0)"
+	"\n" "	.popsection"
+	"\n");
 
 static long hook_install(void) {
 	Uint16 sr = set_ipl7();
@@ -368,43 +403,6 @@ static long hook_remove(void) {
 	return 0;
 }
 
-int native_midi_detect() {
-	return 1;	/* always available */
-}
-
-NativeMidiSong *native_midi_loadsong_RW(SDL_RWops *rw, int freerw) {
-	NativeMidiSong *song;
-
-	printf("%s\n", __FUNCTION__);
-
-	song = (NativeMidiSong *)malloc(sizeof(*song));
-	if (song) {
-		song->firstEvent = CreateMIDIEventList(rw, &song->ticksPerQuarterNote);
-		if (!song->firstEvent) {
-			free(song);
-			song = NULL;
-		}
-	}
-
-	if (freerw)
-		SDL_RWclose(rw);
-
-	return song;
-}
-
-void native_midi_freesong(NativeMidiSong *song) {
-	printf("%s\n", __FUNCTION__);
-
-	if (!song)
-		return;
-
-	if (song == s_currentSong)
-		native_midi_stop();
-
-	FreeMIDIEventList(song->firstEvent);
-	free(song);
-}
-
 void native_midi_start(NativeMidiSong *song, int loops) {
 	int i;
 
@@ -469,8 +467,47 @@ void native_midi_setvolume(int volume) {
 	s_volDirty = SDL_TRUE;
 }
 
+int native_midi_detect() {
+	return 1;	/* always available */
+}
+
+NativeMidiSong *native_midi_loadsong_RW(SDL_RWops *rw, int freerw) {
+	NativeMidiSong *song;
+
+	printf("%s\n", __FUNCTION__);
+
+	song = (NativeMidiSong *)malloc(sizeof(*song));
+	if (song) {
+		song->firstEvent = CreateMIDIEventList(rw, &song->ticksPerQuarterNote);
+		if (!song->firstEvent) {
+			free(song);
+			song = NULL;
+		}
+	}
+
+	if (freerw)
+		SDL_RWclose(rw);
+
+	return song;
+}
+
+void native_midi_freesong(NativeMidiSong *song) {
+	printf("%s\n", __FUNCTION__);
+
+	if (!song)
+		return;
+
+	if (song == s_currentSong)
+		native_midi_stop();
+
+	FreeMIDIEventList(song->firstEvent);
+	free(song);
+}
+
 const char *native_midi_error(void) {
 	return "";
 }
 
 #endif	/* __MINT__ */
+
+#endif
