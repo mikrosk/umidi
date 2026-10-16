@@ -73,12 +73,18 @@ typedef struct {
 	uint32_t now;
 	uint32_t nowFrac;
 
-	uint8_t fifo[UMIDI_FIFO_SIZE];
+	void (* volatile tickCallback)(void);
+	volatile uint32_t tickAdd;			/* ticks per timer period, 16.16 fixed point */
+	uint32_t tickFrac;					/* due ticks, 16.16 fixed point; whole ones wait for FIFO space */
+
+	volatile int locked;				/* nothing is queued while non-zero */
+
+	volatile uint8_t fifo[UMIDI_FIFO_SIZE];
 	volatile uint16_t fifoHead, fifoTail;
 
 	uint8_t lastCC7[16];		/* channel volume as sent by the song */
 	volatile uint8_t volume;	/* master volume */
-	volatile int volDirty;		/* set by UMidiSetVolume(), consumed by the producer */
+	volatile int volDirty;		/* set by UMidiSetVolume(), consumed by the player interrupt */
 
 	volatile int tie;			/* shadow: is the TX interrupt enabled? */
 	_KBDVECS *kbdvecs;
@@ -93,10 +99,16 @@ typedef struct {
 
 UMIDI_DEF int UMidiOpen(UMidiContext* ctx);
 UMIDI_DEF void UMidiClose(UMidiContext* ctx);
+UMIDI_DEF int UMidiSend(UMidiContext* ctx, const uint8_t* msg, uint16_t length);
 UMIDI_DEF void UMidiPlay(UMidiContext* ctx, const UMidiSong* song, int loops);
 UMIDI_DEF void UMidiStop(UMidiContext* ctx);
 UMIDI_DEF int UMidiIsPlaying(const UMidiContext* ctx);
 UMIDI_DEF void UMidiSetVolume(UMidiContext* ctx, int volume);
+UMIDI_DEF void UMidiStartTicks(UMidiContext* ctx, void (*callback)(void));
+UMIDI_DEF void UMidiSetTickRate(UMidiContext* ctx, uint32_t ticksPerMinute);
+UMIDI_DEF void UMidiStopTicks(UMidiContext* ctx);
+UMIDI_DEF void UMidiLock(UMidiContext* ctx);
+UMIDI_DEF void UMidiUnlock(UMidiContext* ctx);
 
 /******************************************************************************/
 
@@ -104,14 +116,23 @@ UMIDI_DEF void UMidiSetVolume(UMidiContext* ctx, int volume);
  * Two interrupt sources, one FIFO between them:
  *
  * 1. Timer B is the PRODUCER, running at a constant 960 Hz (2457600 /
- *    16 / 160), i.e. ~1 ms timing resolution. Each interrupt advances
- *    the song position by one timer period and pushes the messages of
- *    the blocks that became due into the FIFO. Block times are in
- *    microseconds, so tempo changes are already part of them. While the
- *    FIFO is full, due blocks wait and then go out in a burst; the song
- *    position keeps advancing. Once no song plays and the FIFO is empty,
- *    the timer disables its own interrupt; playing a song enables it
- *    again.
+ *    16 / 160), i.e. ~1 ms timing resolution, with one of two
+ *    interrupts installed:
+ *
+ *    The player interrupt advances the song position by one timer
+ *    period and pushes the messages of the blocks that became due into
+ *    the FIFO. Block times are in microseconds, so tempo changes are
+ *    already part of them. While the FIFO is full, due blocks wait and
+ *    then go out in a burst; the song position keeps advancing.
+ *
+ *    The tick interrupt calls the application's sequencer once per MIDI
+ *    tick, at the rate set by UMidiSetTickRate(); the sequencer queues
+ *    its messages with UMidiSend(). A tick waits until the FIFO has
+ *    UMIDI_TICK_RESERVE bytes free, so its messages fit.
+ *
+ *    Once nothing plays and the FIFO is empty, the timer disables its
+ *    own interrupt. While locked, neither interrupt queues anything and
+ *    time stands still.
  *
  * 2. The MIDI ACIA transmit interrupt is the CONSUMER, draining the
  *    FIFO at wire speed (31250 baud / 10 bits = 3125 bytes/s), one
@@ -128,10 +149,11 @@ UMIDI_DEF void UMidiSetVolume(UMidiContext* ctx, int volume);
  * Volume: a MIDI song controls 16 channel volumes (controller 7) but
  * the wire has no master volume, so UMidiSetVolume() implements one by
  * scaling. lastCC7[] holds each channel volume as the song last set
- * it: the producer updates it from controller 7 events and transmits
- * lastCC7[channel] * volume / UMIDI_MAX_VOLUME. UMidiSetVolume()
- * stores volume, sets volDirty and returns; the producer then queues
- * controller 7 messages with the recomputed values for all 16 channels.
+ * it: the player interrupt updates it from controller 7 events and
+ * transmits lastCC7[channel] * volume / UMIDI_MAX_VOLUME.
+ * UMidiSetVolume() stores volume, sets volDirty and returns; the player
+ * interrupt then queues controller 7 messages with the recomputed values
+ * for all 16 channels. The tick callback's messages go out unscaled.
  */
 
 #define UMIDI_ACIA_CTRL			(*(volatile uint8_t *)0xFFFFFC04L)	/* MIDI ACIA control (write) and status (read) register */
@@ -158,8 +180,18 @@ UMIDI_DEF void UMidiSetVolume(UMidiContext* ctx, int volume);
 									* 1000000 \
 									+ UMIDI_MFP_CLOCK/2) / UMIDI_MFP_CLOCK))
 
+/* ticks per minute to ticks per timer period, 16.16 fixed point:
+ * 65536 * prescaler * data / (60 * MFP clock), reduced to fit in 32 bits */
+#define UMIDI_TICK_MUL			256
+#define UMIDI_TICK_DIV			225
+#if UMIDI_TICK_MUL * 60 * UMIDI_MFP_CLOCK \
+	!= UMIDI_TICK_DIV * 65536 * UMIDI_TIMER_B_PRESCALER * UMIDI_TIMER_B_DATA
+#error "UMIDI_TICK_MUL / UMIDI_TICK_DIV don't match the Timer B rate"
+#endif
+
 #define UMIDI_DEFAULT_TEMPO		500000UL	/* us per quarter note (120 bpm) */
 #define UMIDI_DEFAULT_CC7		100			/* GM default channel volume */
+#define UMIDI_TICK_RESERVE		128			/* free FIFO bytes before a tick is processed, so its messages fit */
 
 /* the interrupt handlers and Supexec() routines take no arguments */
 static UMidiContext *UMidiActiveContext;
@@ -233,7 +265,8 @@ static __inline__ void UMidiTransmit(UMidiContext *ctx, int idle) {
 		}
 	} else if (idle) {
 		/* nothing to send and nothing to do: disable the Timer B
-		 * interrupt, starting playback enables it again */
+		 * interrupt; UMidiPlay(), UMidiStartTicks() and UMidiSend()
+		 * enable it again */
 		UMIDI_MFP_IERA &= (uint8_t)~(1 << 0);
 	}
 }
@@ -245,7 +278,7 @@ static void __attribute__((interrupt)) UMidiPlayerInterrupt(void) {
 	const UMidiSong *song = ctx->song;
 	int looped = 0;
 
-	if (!song)
+	if (!song || ctx->locked)
 		goto transmit;
 
 	/* advance song position */
@@ -312,6 +345,27 @@ fifo_full:
 
 transmit:
 	UMidiTransmit(ctx, !ctx->song || UMidiSongEnded(ctx));
+
+	UMIDI_MFP_ISRA = ~(1 << 0);	/* clear in service bit */
+}
+
+/* Producer for the application's sequencer: calls it once per MIDI tick and
+ * arms the ACIA TX interrupt */
+static void __attribute__((interrupt)) UMidiTickInterrupt(void) {
+	UMidiContext *ctx = UMidiActiveContext;
+
+	if (ctx->tickCallback && !ctx->locked) {
+		ctx->tickFrac += ctx->tickAdd;
+		while (ctx->tickFrac >= 0x10000) {
+			/* the tick waits until its messages fit */
+			if (UMidiFifoSpace(ctx) < UMIDI_TICK_RESERVE)
+				break;
+			ctx->tickCallback();
+			ctx->tickFrac -= 0x10000;
+		}
+	}
+
+	UMidiTransmit(ctx, !ctx->tickCallback);
 
 	UMIDI_MFP_ISRA = ~(1 << 0);	/* clear in service bit */
 }
@@ -465,7 +519,8 @@ UMIDI_DEF int UMidiOpen(UMidiContext* ctx) {
 		return 0;
 	}
 
-	/* Timer B through the XBIOS; playing installs its interrupt */
+	/* Timer B through the XBIOS; the player and the tick callback install
+	 * their interrupts */
 	Jdisint(MFP_TIMERB);
 	ctx->oldTimerbVec = (uint32_t)Setexc(0x120>>2, -1);
 
@@ -477,6 +532,7 @@ UMIDI_DEF void UMidiClose(UMidiContext* ctx) {
 		return;
 
 	UMidiStop(ctx);
+	UMidiStopTicks(ctx);
 
 	/* stop Timer B and put its previous vector back; Xbtimer() enables
 	 * the interrupt, so it's disabled afterwards */
@@ -488,14 +544,51 @@ UMIDI_DEF void UMidiClose(UMidiContext* ctx) {
 	UMidiActiveContext = NULL;
 }
 
+UMIDI_DEF int UMidiSend(UMidiContext* ctx, const uint8_t* msg, uint16_t length) {
+	uint16_t i;
+
+	if (!ctx->kbdvecs)
+		return 0;	/* not open */
+	if (!length)
+		return 1;
+
+	if (!ctx->song && !ctx->tickCallback) {
+		/* nothing else queues data: send at once through the XBIOS, once
+		 * the TX interrupt has sent the rest and turned itself off */
+		while (ctx->fifoHead != ctx->fifoTail || ctx->tie)
+			;
+		Midiws(length - 1, msg);
+		return 1;
+	}
+
+	/* locked, so the timer interrupt doesn't queue data meanwhile */
+	++ctx->locked;
+	if (UMidiFifoSpace(ctx) < length) {
+		--ctx->locked;
+		return 0;
+	}
+	for (i = 0; i < length; ++i)
+		UMidiFifoPush(ctx, msg[i]);
+	--ctx->locked;
+
+	/* the player's timer interrupt arms the TX interrupt and may have
+	 * disabled itself; the tick interrupt runs as long as the callback
+	 * is set */
+	if (ctx->song)
+		Jenabint(MFP_TIMERB);
+
+	return 1;
+}
+
 UMIDI_DEF void UMidiPlay(UMidiContext* ctx, const UMidiSong* song, int loops) {
 	int i;
 
 	if (!ctx->kbdvecs)
 		return;	/* not open */
 
-	if (ctx->song)
-		UMidiStop(ctx);
+	/* one song or the tick callback at a time */
+	UMidiStop(ctx);
+	UMidiStopTicks(ctx);
 
 	ctx->curBlock	= 0;
 	ctx->curPos		= 0;
@@ -541,6 +634,48 @@ UMIDI_DEF void UMidiSetVolume(UMidiContext* ctx, int volume) {
 
 	ctx->volume = volume;
 	ctx->volDirty = 1;
+}
+
+UMIDI_DEF void UMidiStartTicks(UMidiContext* ctx, void (*callback)(void)) {
+	if (!ctx->kbdvecs)
+		return;	/* not open */
+
+	/* one song or the tick callback at a time */
+	UMidiStop(ctx);
+	UMidiStopTicks(ctx);
+
+	ctx->tickFrac = 0;
+
+	/* compiler barrier: all of the above is stored before the pointer the
+	 * timer interrupt checks */
+	__asm__ volatile ("" : : : "memory");
+	ctx->tickCallback = callback;
+	Xbtimer(XB_TIMERB, UMIDI_TIMER_B_CTRL, UMIDI_TIMER_B_DATA, UMidiTickInterrupt);
+}
+
+UMIDI_DEF void UMidiSetTickRate(UMidiContext* ctx, uint32_t ticksPerMinute) {
+	ctx->tickAdd = ticksPerMinute * UMIDI_TICK_MUL / UMIDI_TICK_DIV;
+}
+
+UMIDI_DEF void UMidiStopTicks(UMidiContext* ctx) {
+	if (!ctx->tickCallback)
+		return;
+
+	/* no further data is queued; the TX interrupt sends the rest and
+	 * turns itself off */
+	ctx->tickCallback = NULL;
+	while (ctx->fifoHead != ctx->fifoTail || ctx->tie)
+		;
+
+	UMidiSilence();
+}
+
+UMIDI_DEF void UMidiLock(UMidiContext* ctx) {
+	++ctx->locked;
+}
+
+UMIDI_DEF void UMidiUnlock(UMidiContext* ctx) {
+	--ctx->locked;
 }
 
 struct _NativeMidiSong {
