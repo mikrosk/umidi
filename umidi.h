@@ -78,8 +78,6 @@ typedef struct {
 	_KBDVECS *kbdvecs;
 
 	uint32_t oldTimerbVec;
-	uint8_t oldTbcr;
-	int oldTimerbEnabled, oldTimerbMasked;
 } UMidiContext;
 
 #ifndef UMIDI_DEF
@@ -106,7 +104,9 @@ UMIDI_DEF void UMidiSetVolume(UMidiContext* ctx, int volume);
  *    position and pushes the bytes of events that became due into the
  *    FIFO. A tempo change merely recomputes the increment, so any tempo
  *    and any tick rate are representable exactly. A full FIFO pauses
- *    event processing until space frees up; bytes are never dropped.
+ *    event processing until space frees up.
+ *    Once no song plays and the FIFO is empty, the timer disables its
+ *    own interrupt; playing a song enables it again.
  *
  * 2. The MIDI ACIA transmit interrupt is the CONSUMER, draining the
  *    FIFO at wire speed (31250 baud / 10 bits = 3125 bytes/s), one
@@ -139,10 +139,7 @@ UMIDI_DEF void UMidiSetVolume(UMidiContext* ctx, int volume);
 #define UMIDI_ACIA_CTRL_TIE_ON	0xB5
 
 #define UMIDI_MFP_IERA			(*(volatile uint8_t *)0xFFFFFA07L)	/* MFP interrupt enable register A */
-#define UMIDI_MFP_IPRA			(*(volatile uint8_t *)0xFFFFFA0BL)	/* MFP interrupt pending register A */
 #define UMIDI_MFP_ISRA			(*(volatile uint8_t *)0xFFFFFA0FL)	/* MFP interrupt in-service register A */
-#define UMIDI_MFP_IMRA			(*(volatile uint8_t *)0xFFFFFA13L)	/* MFP interrupt mask register A */
-#define UMIDI_MFP_TBCR			(*(volatile uint8_t *)0xFFFFFA1BL)	/* MFP Timer B control register */
 
 #define UMIDI_MFP_CLOCK			2457600UL
 #define UMIDI_TIMER_B_CTRL		3		/* prescaler /16 */
@@ -160,6 +157,7 @@ UMIDI_DEF void UMidiSetVolume(UMidiContext* ctx, int volume);
 
 /* the interrupt handlers and Supexec() routines take no arguments */
 static UMidiContext *UMidiActiveContext;
+static int UMidiHooked;	/* whether the hook is in the kb_midisys chain */
 
 static __inline__ uint16_t UMidiDisableInterrupts(void) {
 	uint16_t sr;
@@ -206,6 +204,9 @@ static __inline__ uint32_t UMidiTicksPerPeriod(const UMidiContext *ctx, uint32_t
 static void __attribute__((interrupt)) UMidiTimerHandler(void) {
 	UMidiContext *ctx = UMidiActiveContext;
 	MIDIEvent *ev;
+
+	if (!ctx->currentSong)
+		goto transmit;
 
 	/* advance song position */
 	ctx->tickFrac += ctx->tickAdd;
@@ -296,12 +297,19 @@ fifo_full:
 		}
 	}
 
-	/* bytes queued and TX interrupt not armed: arm it. If TDRE is
-	 * already set this asserts the ACIA IRQ at once (falling edge on
-	 * GPIP I4), so transmission starts right after we return. */
-	if (ctx->fifoHead != ctx->fifoTail && !ctx->tie) {
-		ctx->tie = 1;
-		UMIDI_ACIA_CTRL = UMIDI_ACIA_CTRL_TIE_ON;
+transmit:
+	if (ctx->fifoHead != ctx->fifoTail) {
+		/* bytes queued and TX interrupt not armed: arm it. If TDRE is
+		 * already set this asserts the ACIA IRQ at once (falling edge on
+		 * GPIP I4), so transmission starts right after we return. */
+		if (!ctx->tie) {
+			ctx->tie = 1;
+			UMIDI_ACIA_CTRL = UMIDI_ACIA_CTRL_TIE_ON;
+		}
+	} else if (!ctx->currentSong || !ctx->events) {
+		/* nothing to send and no song to play: disable the Timer B
+		 * interrupt, UMidiPlay() enables it again */
+		UMIDI_MFP_IERA &= (uint8_t)~(1 << 0);
 	}
 
 	UMIDI_MFP_ISRA = ~(1 << 0);	/* clear in service bit */
@@ -329,7 +337,7 @@ typedef struct {
  * Then the previous routine gets the receive side.
  *
  * The compiler leaves room for the XBRA header right in front of the
- * routine (two bytes per NOP), UMidiInstallHooks() fills it in.
+ * routine (two bytes per NOP), UMidiHookMidisys() fills it in.
  *
  * No specification defines which registers a kbdvecs routine may
  * clobber, but both Atari TOS and EmuTOS save d0-d3/a0-a3 around these
@@ -338,7 +346,9 @@ typedef struct {
 static void __attribute__((patchable_function_entry(sizeof(UMidiXbra) / 2, sizeof(UMidiXbra) / 2))) UMidiSysHandler(void) {
 	UMidiContext *ctx = UMidiActiveContext;
 
-	if (ctx->tie && (UMIDI_ACIA_CTRL & UMIDI_ACIA_TDRE)) {
+	/* no context: closed, but a routine without an XBRA header kept the
+	 * hook in the chain */
+	if (ctx && ctx->tie && (UMIDI_ACIA_CTRL & UMIDI_ACIA_TDRE)) {
 		if (ctx->fifoHead != ctx->fifoTail) {
 			UMIDI_ACIA_DATA = ctx->fifo[ctx->fifoTail];
 			ctx->fifoTail = (ctx->fifoTail + 1) & UMIDI_FIFO_MASK;
@@ -357,71 +367,53 @@ static UMidiXbra *UMidiSysXbra(void) {
 	return (UMidiXbra *)((long)UMidiSysHandler - (long)sizeof(UMidiXbra));
 }
 
-static long UMidiInstallHooks(void) {
+static long UMidiHookMidisys(void) {
 	UMidiContext *ctx = UMidiActiveContext;
 	uint16_t sr = UMidiDisableInterrupts();
+	UMidiXbra *xbra;
+	long vec;
+	long ret = -1;
 
-	ctx->oldTbcr = UMIDI_MFP_TBCR;
-	ctx->oldTimerbEnabled	= (UMIDI_MFP_IERA & (1 << 0)) != 0;
-	ctx->oldTimerbMasked	= (UMIDI_MFP_IMRA & (1 << 0)) != 0;
+	/* another copy of uMIDI has already hooked kb_midisys */
+	for (vec = (long)ctx->kbdvecs->midisys; vec; vec = (long)xbra->old) {
+		xbra = (UMidiXbra *)(vec - (long)sizeof(UMidiXbra));
+		if (xbra->magic != UMIDI_XBRA_MAGIC)
+			break;
+		if (xbra->id == UMIDI_XBRA_ID && vec != (long)UMidiSysHandler)
+			goto out;
+	}
 
-	ctx->tie = 0;
-	UMIDI_ACIA_CTRL = UMIDI_ACIA_CTRL_TIE_OFF;
-
-	if ((long)ctx->kbdvecs->midisys != (long)UMidiSysHandler) {
-		UMidiXbra *xbra = UMidiSysXbra();
-
+	/* still linked when the last unhook failed */
+	if (!UMidiHooked) {
+		xbra = UMidiSysXbra();
 		xbra->magic = UMIDI_XBRA_MAGIC;
 		xbra->id = UMIDI_XBRA_ID;
 		xbra->old = ctx->kbdvecs->midisys;
 		ctx->kbdvecs->midisys = (long (*)(void))UMidiSysHandler;
+		UMidiHooked = 1;
 	}
+	ret = 0;
 
+out:
 	UMidiRestoreInterrupts(sr);
 
-	return 0;
+	return ret;
 }
 
-static void UMidiSendPolled(uint8_t b) {
-	while ((UMIDI_ACIA_CTRL & UMIDI_ACIA_TDRE) == 0)
-		;
-	UMIDI_ACIA_DATA = b;
-}
-
-static long UMidiRemoveHooks(void) {
+static long UMidiUnhookMidisys(void) {
 	UMidiContext *ctx = UMidiActiveContext;
-	uint16_t sr;
+	uint16_t sr = UMidiDisableInterrupts();
 	long *link;
-	int i;
 
-	/* order matters: hardware TIE off first, only then the shadow */
-	sr = UMidiDisableInterrupts();
-	UMIDI_ACIA_CTRL = UMIDI_ACIA_CTRL_TIE_OFF;
-	ctx->tie = 0;
-	UMidiRestoreInterrupts(sr);
-
-	/* Silence every channel (TIE is off, so polled sending cannot race
-	 * the consumer; interrupts stay enabled, this takes ~30 ms).
-	 * A status byte aborts a possibly
-	 * half-transmitted message, so the stream stays parseable. */
-	for (i = 0; i < 16; ++i) {
-		UMidiSendPolled(0xb0 | i);
-		UMidiSendPolled(0x78);	/* All Sound Off */
-		UMidiSendPolled(0x00);
-		UMidiSendPolled(0xb0 | i);
-		UMidiSendPolled(0x7b);	/* All Notes Off */
-		UMidiSendPolled(0x00);
-	}
-
-	sr = UMidiDisableInterrupts();
-
-	/* unlink the hook from the XBRA chain of kb_midisys */
+	/* unlink the hook from the XBRA chain of kb_midisys; a routine
+	 * without an XBRA header in front of it keeps it linked */
 	link = (long *)&ctx->kbdvecs->midisys;
 	while (*link) {
 		UMidiXbra *xbra;
 
 		if (*link == (long)UMidiSysHandler) {
 			*link = (long)UMidiSysXbra()->old;
+			UMidiHooked = 0;
 			break;
 		}
 		xbra = (UMidiXbra *)(*link - (long)sizeof(UMidiXbra));
@@ -430,32 +422,78 @@ static long UMidiRemoveHooks(void) {
 		link = (long *)&xbra->old;
 	}
 
-	UMIDI_MFP_TBCR = ctx->oldTbcr;
-	UMIDI_MFP_IPRA = (uint8_t)~(1 << 0);	/* discard a pending tick of ours */
-	if (ctx->oldTimerbEnabled)
-		UMIDI_MFP_IERA |= 1 << 0;
-	if (ctx->oldTimerbMasked)
-		UMIDI_MFP_IMRA |= 1 << 0;
-
 	UMidiRestoreInterrupts(sr);
 
 	return 0;
 }
 
+/* Silence every channel through the XBIOS, which never writes the ACIA
+ * control register. A status byte aborts a possibly half-transmitted
+ * message, so the stream stays parseable. */
+static void UMidiSilence(void) {
+	uint8_t msg[16 * 6];
+	int i;
+
+	for (i = 0; i < 16; ++i) {
+		msg[i * 6 + 0] = 0xb0 | i;
+		msg[i * 6 + 1] = 0x78;	/* All Sound Off */
+		msg[i * 6 + 2] = 0x00;
+		msg[i * 6 + 3] = 0xb0 | i;
+		msg[i * 6 + 4] = 0x7b;	/* All Notes Off */
+		msg[i * 6 + 5] = 0x00;
+	}
+	Midiws(sizeof(msg) - 1, msg);
+}
+
 UMIDI_DEF int UMidiOpen(UMidiContext* ctx) {
+	if (ctx == UMidiActiveContext)
+		return 0;	/* already open */
+
 	memset(ctx, 0, sizeof(*ctx));
 	ctx->volume = UMIDI_MAX_VOLUME;
+
+	if (UMidiActiveContext)
+		return 0;	/* another context is open */
+
+	/* kb_midisys has no XBIOS function, it's changed in supervisor mode */
+	ctx->kbdvecs = Kbdvbase();
+	UMidiActiveContext = ctx;
+	if (Supexec(UMidiHookMidisys) != 0) {
+		UMidiActiveContext = NULL;
+		ctx->kbdvecs = NULL;
+		return 0;
+	}
+
+	/* Timer B through the XBIOS; its interrupt disables itself while there
+	 * is nothing to do */
+	Jdisint(MFP_TIMERB);
+	ctx->oldTimerbVec = (uint32_t)Setexc(0x120>>2, -1);
+	Xbtimer(XB_TIMERB, UMIDI_TIMER_B_CTRL, UMIDI_TIMER_B_DATA, UMidiTimerHandler);
 
 	return 1;
 }
 
 UMIDI_DEF void UMidiClose(UMidiContext* ctx) {
-	if (ctx->currentSong)
-		UMidiStop(ctx);
+	if (!ctx->kbdvecs)
+		return;
+
+	UMidiStop(ctx);
+
+	/* stop Timer B and put its previous vector back; Xbtimer() enables
+	 * the interrupt, so it's disabled afterwards */
+	Xbtimer(XB_TIMERB, 0, 0, ctx->oldTimerbVec);
+	Jdisint(MFP_TIMERB);
+
+	Supexec(UMidiUnhookMidisys);
+	ctx->kbdvecs = NULL;
+	UMidiActiveContext = NULL;
 }
 
 UMIDI_DEF void UMidiPlay(UMidiContext* ctx, NativeMidiSong* song, int loops) {
 	int i;
+
+	if (!ctx->kbdvecs)
+		return;	/* not open */
 
 	if (ctx->currentSong)
 		UMidiStop(ctx);
@@ -466,39 +504,35 @@ UMIDI_DEF void UMidiPlay(UMidiContext* ctx, NativeMidiSong* song, int loops) {
 	ctx->tickAdd	= UMidiTicksPerPeriod(ctx, UMIDI_DEFAULT_TEMPO);
 	ctx->tickFrac	= 0;
 	ctx->tickInt	= 0;
-	ctx->fifoHead	= ctx->fifoTail = 0;
 
 	for (i = 0; i < 16; ++i)
 		ctx->lastCC7[i] = UMIDI_DEFAULT_CC7;
 
-	ctx->kbdvecs = Kbdvbase();
-	UMidiActiveContext = ctx;
-	Supexec(UMidiInstallHooks);
-
 	ctx->loops = loops;	/* number of repeats after the first pass; -1 = forever */
 
+	/* compiler barrier: all of the song is stored before the pointer the
+	 * timer interrupt checks */
+	__asm__ volatile ("" : : : "memory");
 	ctx->currentSong = song;
-
-	Jdisint(MFP_TIMERB);
-	ctx->oldTimerbVec = (uint32_t)Setexc(0x120>>2, -1);
-	Xbtimer(XB_TIMERB, UMIDI_TIMER_B_CTRL, UMIDI_TIMER_B_DATA, UMidiTimerHandler);
+	Jenabint(MFP_TIMERB);
 }
 
 UMIDI_DEF void UMidiStop(UMidiContext* ctx) {
-	Jdisint(MFP_TIMERB);
-	if (ctx->oldTimerbVec) {
-		(void)Setexc(0x120>>2, ctx->oldTimerbVec);
-		ctx->oldTimerbVec = 0;
-	}
+	if (!ctx->currentSong)
+		return;
 
-	if (ctx->kbdvecs)
-		Supexec(UMidiRemoveHooks);
-
+	/* drop the queue: nothing queues data any more, and the TX interrupt
+	 * can't split this store; it turns itself off on the empty FIFO */
 	ctx->currentSong = NULL;
+	ctx->fifoTail = ctx->fifoHead;
+	while (ctx->tie)
+		;
+
+	UMidiSilence();
 }
 
 UMIDI_DEF int UMidiIsPlaying(const UMidiContext* ctx) {
-	return ctx->currentSong != NULL
+	return ctx->currentSong
 		&& (ctx->events || ctx->fifoHead != ctx->fifoTail);
 }
 
@@ -518,14 +552,17 @@ static int s_volume = MIX_MAX_VOLUME;
 void native_midi_start(NativeMidiSong *song, int loops) {
 	printf("%s: %d\n", __FUNCTION__, loops);
 
-	UMidiSetVolume(&s_ctx, s_volume);
-	UMidiPlay(&s_ctx, song, loops);
+	UMidiClose(&s_ctx);
+	if (UMidiOpen(&s_ctx)) {
+		UMidiSetVolume(&s_ctx, s_volume);
+		UMidiPlay(&s_ctx, song, loops);
+	}
 }
 
 void native_midi_stop() {
 	printf("%s\n", __FUNCTION__);
 
-	UMidiStop(&s_ctx);
+	UMidiClose(&s_ctx);
 }
 
 int native_midi_active() {
@@ -540,7 +577,7 @@ void native_midi_setvolume(int volume) {
 }
 
 int native_midi_detect() {
-	return UMidiOpen(&s_ctx);	/* always available */
+	return 1;	/* always available */
 }
 
 NativeMidiSong *native_midi_loadsong_RW(SDL_RWops *rw, int freerw) {
