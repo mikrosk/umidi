@@ -46,26 +46,32 @@
 #define UMIDI_FIFO_SIZE			2048		/* power of two */
 #define UMIDI_FIFO_MASK			(UMIDI_FIFO_SIZE - 1)
 
-struct _NativeMidiSong {
-	MIDIEvent *firstEvent;
-	uint16_t ticksPerQuarterNote; /* 48 by default (independent of the tempo) */
-};
+/* MIDI messages to be sent at the same time */
+typedef struct {
+	uint32_t time;	/* microseconds from the song start */
+	uint32_t end;	/* offset just past the last byte of the block in the song data */
+} UMidiBlock;
+
+/* channel messages with their status bytes and complete system exclusive
+ * messages, each shorter than UMIDI_FIFO_SIZE */
+typedef struct {
+	const UMidiBlock* blocks;	/* sorted by time */
+	const uint8_t* data;		/* messages of all blocks */
+	uint32_t numBlocks;
+	uint32_t loopBlock;			/* block the repeats start at */
+} UMidiSong;
 
 typedef struct {
 	/* Only one song plays at a time; the playback state lives here and not
-	 * in NativeMidiSong. */
-	NativeMidiSong * volatile currentSong;	/* NULL when stopped */
-	MIDIEvent * volatile events;			/* next event to schedule */
-	uint32_t ticksPerQuarterNote;
-	int loops;
+	 * in UMidiSong. */
+	const UMidiSong * volatile song;	/* NULL when stopped */
+	volatile uint32_t curBlock;			/* next block to queue */
+	uint32_t curPos;					/* offset of the next message to queue */
+	volatile int loops;
 
-	/* 16.16 fixed point: upper 16 bits integer part, lower 16 bits fraction.
-	 * Every timer interrupt executes tickFrac += tickAdd; whenever
-	 * tickFrac crosses 1.0, the whole part moves into tickInt and only
-	 * the fraction stays. */
-	uint32_t tickAdd;
-	uint32_t tickFrac;
-	uint32_t tickInt;
+	/* song position in microseconds and its 16-bit fraction */
+	uint32_t now;
+	uint32_t nowFrac;
 
 	uint8_t fifo[UMIDI_FIFO_SIZE];
 	volatile uint16_t fifoHead, fifoTail;
@@ -87,7 +93,7 @@ typedef struct {
 
 UMIDI_DEF int UMidiOpen(UMidiContext* ctx);
 UMIDI_DEF void UMidiClose(UMidiContext* ctx);
-UMIDI_DEF void UMidiPlay(UMidiContext* ctx, NativeMidiSong* song, int loops);
+UMIDI_DEF void UMidiPlay(UMidiContext* ctx, const UMidiSong* song, int loops);
 UMIDI_DEF void UMidiStop(UMidiContext* ctx);
 UMIDI_DEF int UMidiIsPlaying(const UMidiContext* ctx);
 UMIDI_DEF void UMidiSetVolume(UMidiContext* ctx, int volume);
@@ -98,15 +104,14 @@ UMIDI_DEF void UMidiSetVolume(UMidiContext* ctx, int volume);
  * Two interrupt sources, one FIFO between them:
  *
  * 1. Timer B is the PRODUCER, running at a constant 960 Hz (2457600 /
- *    16 / 160), i.e. ~1 ms event timing resolution. Each interrupt adds
- *    a 16.16 fixed-point increment (MIDI ticks per timer period, derived
- *    from ticksPerQuarterNote and the current tempo) to the song
- *    position and pushes the bytes of events that became due into the
- *    FIFO. A tempo change merely recomputes the increment, so any tempo
- *    and any tick rate are representable exactly. A full FIFO pauses
- *    event processing until space frees up.
- *    Once no song plays and the FIFO is empty, the timer disables its
- *    own interrupt; playing a song enables it again.
+ *    16 / 160), i.e. ~1 ms timing resolution. Each interrupt advances
+ *    the song position by one timer period and pushes the messages of
+ *    the blocks that became due into the FIFO. Block times are in
+ *    microseconds, so tempo changes are already part of them. While the
+ *    FIFO is full, due blocks wait and then go out in a burst; the song
+ *    position keeps advancing. Once no song plays and the FIFO is empty,
+ *    the timer disables its own interrupt; playing a song enables it
+ *    again.
  *
  * 2. The MIDI ACIA transmit interrupt is the CONSUMER, draining the
  *    FIFO at wire speed (31250 baud / 10 bits = 3125 bytes/s), one
@@ -146,7 +151,8 @@ UMIDI_DEF void UMidiSetVolume(UMidiContext* ctx, int volume);
 #define UMIDI_TIMER_B_PRESCALER	16
 #define UMIDI_TIMER_B_DATA		160		/* 2457600/16/160 = 960 Hz */
 
-#define UMIDI_TICK_NUMER		((uint32_t)((65536ULL \
+/* Timer B period in microseconds, 16.16 fixed point */
+#define UMIDI_TIMER_B_PERIOD	((uint32_t)((65536ULL \
 									* UMIDI_TIMER_B_PRESCALER \
 									* UMIDI_TIMER_B_DATA \
 									* 1000000 \
@@ -188,102 +194,91 @@ static __inline__ void UMidiFifoPush(UMidiContext *ctx, uint8_t b) {
 	ctx->fifoHead = (ctx->fifoHead + 1) & UMIDI_FIFO_MASK;
 }
 
-/* Returns how many MIDI ticks elapse during one timer period, as 16.16
- * fixed point: 65536 * ticksPerQuarterNote * period_us / tempo_us. */
-static __inline__ uint32_t UMidiTicksPerPeriod(const UMidiContext *ctx, uint32_t tempo) {
-	uint32_t q, r;
+/* Returns the length of a message of the song data */
+static __inline__ uint16_t UMidiMessageLength(const uint8_t *msg) {
+	switch (msg[0] & 0xf0) {
+		case 0xc0:		/* program change */
+		case 0xd0:		/* channel pressure */
+			return 2;
 
-	q = UMIDI_TICK_NUMER / tempo;
-	r = UMIDI_TICK_NUMER % tempo;
+		case 0xf0: {	/* system exclusive */
+			uint16_t length = 2;
 
-	return ctx->ticksPerQuarterNote * q
-		+ (ctx->ticksPerQuarterNote * r + tempo / 2) / tempo;
+			while (msg[length - 1] != 0xf7)
+				length++;
+			return length;
+		}
+
+		default:
+			return 3;
+	}
 }
 
-/* Producer: schedule due events into the FIFO, arm the ACIA TX interrupt */
+/* the song played to its end and doesn't repeat */
+static __inline__ int UMidiSongEnded(const UMidiContext *ctx) {
+	return ctx->curBlock == ctx->song->numBlocks
+		&& (!ctx->loops || ctx->song->loopBlock >= ctx->song->numBlocks);
+}
+
+/* Producer: queue the messages of the due blocks into the FIFO, arm the
+ * ACIA TX interrupt */
 static void __attribute__((interrupt)) UMidiTimerHandler(void) {
 	UMidiContext *ctx = UMidiActiveContext;
-	MIDIEvent *ev;
+	const UMidiSong *song = ctx->song;
+	int looped = 0;
 
-	if (!ctx->currentSong)
+	if (!song)
 		goto transmit;
 
 	/* advance song position */
-	ctx->tickFrac += ctx->tickAdd;
-	ctx->tickInt += ctx->tickFrac >> 16;
-	ctx->tickFrac &= 0xffff;
+	ctx->nowFrac += UMIDI_TIMER_B_PERIOD & 0xffff;
+	ctx->now += (UMIDI_TIMER_B_PERIOD >> 16) + (ctx->nowFrac >> 16);
+	ctx->nowFrac &= 0xffff;
 
-	/* schedule due events */
-	ev = ctx->events;
-	while (ev && ev->time <= ctx->tickInt) {
-		const uint8_t status = ev->status;
+	/* queue due blocks */
+	for (;;) {
+		if (ctx->curBlock == song->numBlocks) {
+			/* repeats continue at the loop block, at most once per timer
+			 * period: a song without any delay would loop forever otherwise */
+			if (UMidiSongEnded(ctx) || looped)
+				break;
+			if (ctx->loops > 0)
+				ctx->loops--;
+			looped = 1;
 
-		if (status == 0xff) {
-			/* Meta event; never sent over the wire */
-			if (ev->data[0] == 0x51 && ev->extraLen == 3) {
-				/* Tempo change */
-				uint32_t tempo = ((uint32_t)ev->extraData[0] << 16)
-							| ((uint32_t)ev->extraData[1] << 8)
-							| (uint32_t)ev->extraData[2];
-				if (tempo)
-					ctx->tickAdd = UMidiTicksPerPeriod(ctx, tempo);
-			}
-			/* 0x2f (end of track) and the rest are ignored;
-			 * end of song == end of the event list */
-		} else {
-			switch (status >> 4) {
-				case MIDI_STATUS_CONTROLLER:
-					if (UMidiFifoSpace(ctx) < 3)
-						goto fifo_full;
-					if (ev->data[0] == 0x07) {
-						/* Channel volume: remember it and send it scaled
-						 * by the master volume */
-						ctx->lastCC7[status & 0x0f] = ev->data[1];
-						UMidiFifoPush(ctx, status);
-						UMidiFifoPush(ctx, 0x07);
-						UMidiFifoPush(ctx, UMidiScaledVolume(ctx, status & 0x0f));
-						break;
-					}
-					/* fall through */
-				case MIDI_STATUS_NOTE_OFF:
-				case MIDI_STATUS_NOTE_ON:
-				case MIDI_STATUS_AFTERTOUCH:
-				case MIDI_STATUS_PITCH_WHEEL:
-					if (UMidiFifoSpace(ctx) < 3)
-						goto fifo_full;
-					UMidiFifoPush(ctx, status);
-					UMidiFifoPush(ctx, ev->data[0]);
-					UMidiFifoPush(ctx, ev->data[1]);
-					break;
-
-				case MIDI_STATUS_PROG_CHANGE:
-				case MIDI_STATUS_PRESSURE:
-					if (UMidiFifoSpace(ctx) < 2)
-						goto fifo_full;
-					UMidiFifoPush(ctx, status);
-					UMidiFifoPush(ctx, ev->data[0]);
-					break;
-
-				default:
-					/* Sysex (0xf0/0xf7): skipped */
-					break;
-			}
+			ctx->curBlock	= song->loopBlock;
+			ctx->curPos		= song->loopBlock ? song->blocks[song->loopBlock - 1].end : 0;
+			ctx->now		= song->blocks[song->loopBlock].time;
+			ctx->nowFrac	= 0;
 		}
 
-		ev = ev->next;
+		if (song->blocks[ctx->curBlock].time > ctx->now)
+			break;
+
+		while (ctx->curPos < song->blocks[ctx->curBlock].end) {
+			const uint8_t *msg = song->data + ctx->curPos;
+			const uint16_t length = UMidiMessageLength(msg);
+			uint16_t i;
+
+			if (UMidiFifoSpace(ctx) < length)
+				goto fifo_full;
+
+			if ((msg[0] & 0xf0) == 0xb0 && msg[1] == 0x07) {
+				/* Channel volume: remember it and send it scaled
+				 * by the master volume */
+				ctx->lastCC7[msg[0] & 0x0f] = msg[2];
+				UMidiFifoPush(ctx, msg[0]);
+				UMidiFifoPush(ctx, 0x07);
+				UMidiFifoPush(ctx, UMidiScaledVolume(ctx, msg[0] & 0x0f));
+			} else {
+				for (i = 0; i < length; ++i)
+					UMidiFifoPush(ctx, msg[i]);
+			}
+			ctx->curPos += length;
+		}
+		ctx->curBlock++;
 	}
 fifo_full:
-	ctx->events = ev;
-
-	if (!ev && ctx->loops) {
-		if (ctx->loops > 0)
-			ctx->loops--;
-
-		ctx->events		= ctx->currentSong->firstEvent;
-		ctx->tickAdd	= UMidiTicksPerPeriod(ctx, UMIDI_DEFAULT_TEMPO);
-		ctx->tickFrac	= 0;
-		ctx->tickInt	= 0;
-	}
 
 	/* Master volume change: resend the scaled channel volumes */
 	if (ctx->volDirty && UMidiFifoSpace(ctx) >= 16 * 3) {
@@ -306,7 +301,7 @@ transmit:
 			ctx->tie = 1;
 			UMIDI_ACIA_CTRL = UMIDI_ACIA_CTRL_TIE_ON;
 		}
-	} else if (!ctx->currentSong || !ctx->events) {
+	} else if (!ctx->song || UMidiSongEnded(ctx)) {
 		/* nothing to send and no song to play: disable the Timer B
 		 * interrupt, UMidiPlay() enables it again */
 		UMIDI_MFP_IERA &= (uint8_t)~(1 << 0);
@@ -489,21 +484,19 @@ UMIDI_DEF void UMidiClose(UMidiContext* ctx) {
 	UMidiActiveContext = NULL;
 }
 
-UMIDI_DEF void UMidiPlay(UMidiContext* ctx, NativeMidiSong* song, int loops) {
+UMIDI_DEF void UMidiPlay(UMidiContext* ctx, const UMidiSong* song, int loops) {
 	int i;
 
 	if (!ctx->kbdvecs)
 		return;	/* not open */
 
-	if (ctx->currentSong)
+	if (ctx->song)
 		UMidiStop(ctx);
 
-	ctx->events = song->firstEvent;
-	ctx->ticksPerQuarterNote = song->ticksPerQuarterNote;
-
-	ctx->tickAdd	= UMidiTicksPerPeriod(ctx, UMIDI_DEFAULT_TEMPO);
-	ctx->tickFrac	= 0;
-	ctx->tickInt	= 0;
+	ctx->curBlock	= 0;
+	ctx->curPos		= 0;
+	ctx->now		= 0;
+	ctx->nowFrac	= 0;
 
 	for (i = 0; i < 16; ++i)
 		ctx->lastCC7[i] = UMIDI_DEFAULT_CC7;
@@ -513,17 +506,17 @@ UMIDI_DEF void UMidiPlay(UMidiContext* ctx, NativeMidiSong* song, int loops) {
 	/* compiler barrier: all of the song is stored before the pointer the
 	 * timer interrupt checks */
 	__asm__ volatile ("" : : : "memory");
-	ctx->currentSong = song;
+	ctx->song = song;
 	Jenabint(MFP_TIMERB);
 }
 
 UMIDI_DEF void UMidiStop(UMidiContext* ctx) {
-	if (!ctx->currentSong)
+	if (!ctx->song)
 		return;
 
 	/* drop the queue: nothing queues data any more, and the TX interrupt
 	 * can't split this store; it turns itself off on the empty FIFO */
-	ctx->currentSong = NULL;
+	ctx->song = NULL;
 	ctx->fifoTail = ctx->fifoHead;
 	while (ctx->tie)
 		;
@@ -532,8 +525,8 @@ UMIDI_DEF void UMidiStop(UMidiContext* ctx) {
 }
 
 UMIDI_DEF int UMidiIsPlaying(const UMidiContext* ctx) {
-	return ctx->currentSong
-		&& (ctx->events || ctx->fifoHead != ctx->fifoTail);
+	return ctx->song
+		&& (!UMidiSongEnded(ctx) || ctx->fifoHead != ctx->fifoTail);
 }
 
 UMIDI_DEF void UMidiSetVolume(UMidiContext* ctx, int volume) {
@@ -546,8 +539,102 @@ UMIDI_DEF void UMidiSetVolume(UMidiContext* ctx, int volume) {
 	ctx->volDirty = 1;
 }
 
+struct _NativeMidiSong {
+	UMidiSong song;
+};
+
 static UMidiContext s_ctx;
 static int s_volume = MIX_MAX_VOLUME;
+
+/* Builds the blocks of a song from SDL_mixer's event list: channel
+ * messages only, their tick times turned into microseconds with the tempo
+ * changes applied. An empty block at the time of the last event (end of
+ * track) keeps the length of the song. */
+static int native_midi_convert(UMidiSong *song, const MIDIEvent *events, Uint16 division) {
+	const MIDIEvent *ev;
+	UMidiBlock *blocks;
+	uint8_t *data;
+	uint32_t numEvents = 0, numBlocks = 0, size = 0;
+	uint32_t tick = 0, time = 0, rem = 0;
+	uint32_t usPerTick, usRem;
+
+	if (!division)
+		return 0;
+
+	for (ev = events; ev; ev = ev->next)
+		numEvents++;
+
+	/* at most one block per event plus the end of track, at most three
+	 * bytes per event */
+	blocks = (UMidiBlock *)malloc((numEvents + 1) * sizeof(*blocks));
+	data = (uint8_t *)malloc(numEvents * 3 + 1);
+	if (!blocks || !data) {
+		free(blocks);
+		free(data);
+		return 0;
+	}
+
+	usPerTick = UMIDI_DEFAULT_TEMPO / division;
+	usRem = UMIDI_DEFAULT_TEMPO % division;
+
+	for (ev = events; ev; ev = ev->next) {
+		const uint8_t status = ev->status;
+		const uint32_t delta = ev->time - tick;
+		uint32_t length;
+
+		/* ticks to microseconds; the remainder carries over, so no
+		 * rounding error accumulates, and stays below division squared */
+		tick = ev->time;
+		time += delta * usPerTick + delta / division * usRem;
+		rem += delta % division * usRem;
+		if (rem >= division) {
+			time += rem / division;
+			rem %= division;
+		}
+
+		if (status == 0xff) {
+			/* meta event: only a tempo change matters */
+			if (ev->data[0] == 0x51 && ev->extraLen == 3) {
+				uint32_t tempo = ((uint32_t)ev->extraData[0] << 16)
+					| ((uint32_t)ev->extraData[1] << 8)
+					| (uint32_t)ev->extraData[2];
+				if (tempo) {
+					usPerTick = tempo / division;
+					usRem = tempo % division;
+				}
+			}
+			continue;
+		}
+		if (status >= 0xf0)
+			continue;	/* system exclusive: skipped */
+
+		if (numBlocks == 0 || time != blocks[numBlocks - 1].time) {
+			blocks[numBlocks].time = time;
+			numBlocks++;
+		}
+
+		length = ((status & 0xf0) == 0xc0 || (status & 0xf0) == 0xd0) ? 2 : 3;
+		data[size] = status;
+		data[size + 1] = ev->data[0];
+		if (length == 3)
+			data[size + 2] = ev->data[1];
+		size += length;
+		blocks[numBlocks - 1].end = size;
+	}
+
+	if (numBlocks == 0 || time != blocks[numBlocks - 1].time) {
+		blocks[numBlocks].time = time;
+		blocks[numBlocks].end = size;
+		numBlocks++;
+	}
+
+	song->blocks = blocks;
+	song->data = data;
+	song->numBlocks = numBlocks;
+	song->loopBlock = 0;
+
+	return 1;
+}
 
 void native_midi_start(NativeMidiSong *song, int loops) {
 	printf("%s: %d\n", __FUNCTION__, loops);
@@ -555,7 +642,7 @@ void native_midi_start(NativeMidiSong *song, int loops) {
 	UMidiClose(&s_ctx);
 	if (UMidiOpen(&s_ctx)) {
 		UMidiSetVolume(&s_ctx, s_volume);
-		UMidiPlay(&s_ctx, song, loops);
+		UMidiPlay(&s_ctx, &song->song, loops);
 	}
 }
 
@@ -582,16 +669,20 @@ int native_midi_detect() {
 
 NativeMidiSong *native_midi_loadsong_RW(SDL_RWops *rw, int freerw) {
 	NativeMidiSong *song;
+	MIDIEvent *events;
+	Uint16 division;
 
 	printf("%s\n", __FUNCTION__);
 
 	song = (NativeMidiSong *)malloc(sizeof(*song));
 	if (song) {
-		song->firstEvent = CreateMIDIEventList(rw, &song->ticksPerQuarterNote);
-		if (!song->firstEvent) {
+		events = CreateMIDIEventList(rw, &division);
+		if (!events || !native_midi_convert(&song->song, events, division)) {
 			free(song);
 			song = NULL;
 		}
+		if (events)
+			FreeMIDIEventList(events);
 	}
 
 	if (freerw)
@@ -608,10 +699,11 @@ void native_midi_freesong(NativeMidiSong *song) {
 	if (!song)
 		return;
 
-	if (song == ctx->currentSong)
+	if (&song->song == ctx->song)
 		native_midi_stop();
 
-	FreeMIDIEventList(song->firstEvent);
+	free((void *)song->song.blocks);
+	free((void *)song->song.data);
 	free(song);
 }
 
