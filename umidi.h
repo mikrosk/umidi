@@ -28,6 +28,7 @@
 
 #ifdef __MINT__
 
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -39,12 +40,15 @@
 #include "native_midi.h"
 #include "native_midi_common.h"
 
+/* highest volume for UMidiSetVolume() */
+#define UMIDI_MAX_VOLUME 128
+
 #define UMIDI_FIFO_SIZE			2048		/* power of two */
 #define UMIDI_FIFO_MASK			(UMIDI_FIFO_SIZE - 1)
 
 struct _NativeMidiSong {
 	MIDIEvent *firstEvent;
-	Uint16 ticksPerQuarterNote; /* 48 by default (independent of the tempo) */
+	uint16_t ticksPerQuarterNote; /* 48 by default (independent of the tempo) */
 };
 
 typedef struct {
@@ -52,30 +56,30 @@ typedef struct {
 	 * in NativeMidiSong. */
 	NativeMidiSong * volatile currentSong;	/* NULL when stopped */
 	MIDIEvent * volatile events;			/* next event to schedule */
-	Uint32 ticksPerQuarterNote;
+	uint32_t ticksPerQuarterNote;
 	int loops;
 
 	/* 16.16 fixed point: upper 16 bits integer part, lower 16 bits fraction.
 	 * Every timer interrupt executes tickFrac += tickAdd; whenever
 	 * tickFrac crosses 1.0, the whole part moves into tickInt and only
 	 * the fraction stays. */
-	Uint32 tickAdd;
-	Uint32 tickFrac;
-	Uint32 tickInt;
+	uint32_t tickAdd;
+	uint32_t tickFrac;
+	uint32_t tickInt;
 
-	Uint8 fifo[UMIDI_FIFO_SIZE];
-	volatile Uint16 fifoHead, fifoTail;
+	uint8_t fifo[UMIDI_FIFO_SIZE];
+	volatile uint16_t fifoHead, fifoTail;
 
-	Uint8 lastCC7[16];				/* channel volume as sent by the song */
-	volatile Uint8 volume;			/* master volume */
-	volatile SDL_bool volDirty;		/* set by UMidiSetVolume(), consumed by the producer */
+	uint8_t lastCC7[16];		/* channel volume as sent by the song */
+	volatile uint8_t volume;	/* master volume */
+	volatile int volDirty;		/* set by UMidiSetVolume(), consumed by the producer */
 
-	volatile SDL_bool tie;			/* shadow: is the TX interrupt enabled? */
+	volatile int tie;			/* shadow: is the TX interrupt enabled? */
 	_KBDVECS *kbdvecs;
 
-	Uint32 oldTimerbVec;
-	Uint8 oldTbcr;
-	SDL_bool oldTimerbEnabled, oldTimerbMasked;
+	uint32_t oldTimerbVec;
+	uint8_t oldTbcr;
+	int oldTimerbEnabled, oldTimerbMasked;
 } UMidiContext;
 
 #ifndef UMIDI_DEF
@@ -124,13 +128,13 @@ UMIDI_DEF void UMidiSetVolume(UMidiContext* ctx, int volume);
  * the wire has no master volume, so UMidiSetVolume() implements one by
  * scaling. lastCC7[] holds each channel volume as the song last set
  * it: the producer updates it from controller 7 events and transmits
- * lastCC7[channel] * volume / MIX_MAX_VOLUME. UMidiSetVolume()
+ * lastCC7[channel] * volume / UMIDI_MAX_VOLUME. UMidiSetVolume()
  * stores volume, sets volDirty and returns; the producer then queues
  * controller 7 messages with the recomputed values for all 16 channels.
  */
 
-#define UMIDI_ACIA_CTRL			(*(volatile Uint8 *)0xFFFFFC04L)	/* MIDI ACIA control (write) and status (read) register */
-#define UMIDI_ACIA_DATA			(*(volatile Uint8 *)0xFFFFFC06L)	/* MIDI ACIA data register */
+#define UMIDI_ACIA_CTRL			(*(volatile uint8_t *)0xFFFFFC04L)	/* MIDI ACIA control (write) and status (read) register */
+#define UMIDI_ACIA_DATA			(*(volatile uint8_t *)0xFFFFFC06L)	/* MIDI ACIA data register */
 #define UMIDI_ACIA_TDRE			(1 << 1)							/* ACIA status: transmit data register empty */
 
 /* /16 clock, 8N1, RTS low, TX interrupt off, RX interrupt on.*/
@@ -138,18 +142,18 @@ UMIDI_DEF void UMidiSetVolume(UMidiContext* ctx, int volume);
 /* /16 clock, 8N1, RTS low, TX interrupt on, RX interrupt on.*/
 #define UMIDI_ACIA_CTRL_TIE_ON	0xB5
 
-#define UMIDI_MFP_IERA			(*(volatile Uint8 *)0xFFFFFA07L)	/* MFP interrupt enable register A */
-#define UMIDI_MFP_IPRA			(*(volatile Uint8 *)0xFFFFFA0BL)	/* MFP interrupt pending register A */
-#define UMIDI_MFP_ISRA			(*(volatile Uint8 *)0xFFFFFA0FL)	/* MFP interrupt in-service register A */
-#define UMIDI_MFP_IMRA			(*(volatile Uint8 *)0xFFFFFA13L)	/* MFP interrupt mask register A */
-#define UMIDI_MFP_TBCR			(*(volatile Uint8 *)0xFFFFFA1BL)	/* MFP Timer B control register */
+#define UMIDI_MFP_IERA			(*(volatile uint8_t *)0xFFFFFA07L)	/* MFP interrupt enable register A */
+#define UMIDI_MFP_IPRA			(*(volatile uint8_t *)0xFFFFFA0BL)	/* MFP interrupt pending register A */
+#define UMIDI_MFP_ISRA			(*(volatile uint8_t *)0xFFFFFA0FL)	/* MFP interrupt in-service register A */
+#define UMIDI_MFP_IMRA			(*(volatile uint8_t *)0xFFFFFA13L)	/* MFP interrupt mask register A */
+#define UMIDI_MFP_TBCR			(*(volatile uint8_t *)0xFFFFFA1BL)	/* MFP Timer B control register */
 
 #define UMIDI_MFP_CLOCK			2457600UL
 #define UMIDI_TIMER_B_CTRL		3		/* prescaler /16 */
 #define UMIDI_TIMER_B_PRESCALER	16
 #define UMIDI_TIMER_B_DATA		160		/* 2457600/16/160 = 960 Hz */
 
-#define UMIDI_TICK_NUMER		((Uint32)((65536ULL \
+#define UMIDI_TICK_NUMER		((uint32_t)((65536ULL \
 									* UMIDI_TIMER_B_PRESCALER \
 									* UMIDI_TIMER_B_DATA \
 									* 1000000 \
@@ -161,8 +165,8 @@ UMIDI_DEF void UMidiSetVolume(UMidiContext* ctx, int volume);
 /* the interrupt handlers and Supexec() routines take no arguments */
 static UMidiContext *UMidiActiveContext;
 
-static __inline__ Uint16 UMidiDisableInterrupts(void) {
-	Uint16 sr;
+static __inline__ uint16_t UMidiDisableInterrupts(void) {
+	uint16_t sr;
 #ifdef __mcoldfire__
 	/* ColdFire has no ori to SR; this runs in supervisor mode, so
 	 * setting the S bit along with the mask is safe */
@@ -173,27 +177,27 @@ static __inline__ Uint16 UMidiDisableInterrupts(void) {
 	return sr;
 }
 
-static __inline__ void UMidiRestoreInterrupts(Uint16 sr) {
+static __inline__ void UMidiRestoreInterrupts(uint16_t sr) {
 	__asm__ volatile ("move.w %0,%%sr" : : "d"(sr) : "memory");
 }
 
-static __inline__ Uint8 UMidiScaledVolume(const UMidiContext *ctx, Uint8 chan) {
-	return (Uint16)(ctx->lastCC7[chan] * ctx->volume) / MIX_MAX_VOLUME;
+static __inline__ uint8_t UMidiScaledVolume(const UMidiContext *ctx, uint8_t chan) {
+	return (uint16_t)(ctx->lastCC7[chan] * ctx->volume) / UMIDI_MAX_VOLUME;
 }
 
-static __inline__ Uint16 UMidiFifoSpace(const UMidiContext *ctx) {
+static __inline__ uint16_t UMidiFifoSpace(const UMidiContext *ctx) {
 	return UMIDI_FIFO_SIZE - 1 - ((ctx->fifoHead - ctx->fifoTail) & UMIDI_FIFO_MASK);
 }
 
-static __inline__ void UMidiFifoPush(UMidiContext *ctx, Uint8 b) {
+static __inline__ void UMidiFifoPush(UMidiContext *ctx, uint8_t b) {
 	ctx->fifo[ctx->fifoHead] = b;
 	ctx->fifoHead = (ctx->fifoHead + 1) & UMIDI_FIFO_MASK;
 }
 
 /* Returns how many MIDI ticks elapse during one timer period, as 16.16
  * fixed point: 65536 * ticksPerQuarterNote * period_us / tempo_us. */
-static __inline__ Uint32 UMidiTicksPerPeriod(const UMidiContext *ctx, Uint32 tempo) {
-	Uint32 q, r;
+static __inline__ uint32_t UMidiTicksPerPeriod(const UMidiContext *ctx, uint32_t tempo) {
+	uint32_t q, r;
 
 	q = UMIDI_TICK_NUMER / tempo;
 	r = UMIDI_TICK_NUMER % tempo;
@@ -215,15 +219,15 @@ static void __attribute__((interrupt)) UMidiTimerHandler(void) {
 	/* schedule due events */
 	ev = ctx->events;
 	while (ev && ev->time <= ctx->tickInt) {
-		const Uint8 status = ev->status;
+		const uint8_t status = ev->status;
 
 		if (status == 0xff) {
 			/* Meta event; never sent over the wire */
 			if (ev->data[0] == 0x51 && ev->extraLen == 3) {
 				/* Tempo change */
-				Uint32 tempo = ((Uint32)ev->extraData[0] << 16)
-							| ((Uint32)ev->extraData[1] << 8)
-							| (Uint32)ev->extraData[2];
+				uint32_t tempo = ((uint32_t)ev->extraData[0] << 16)
+							| ((uint32_t)ev->extraData[1] << 8)
+							| (uint32_t)ev->extraData[2];
 				if (tempo)
 					ctx->tickAdd = UMidiTicksPerPeriod(ctx, tempo);
 			}
@@ -288,7 +292,7 @@ fifo_full:
 	if (ctx->volDirty && UMidiFifoSpace(ctx) >= 16 * 3) {
 		int i;
 
-		ctx->volDirty = SDL_FALSE;
+		ctx->volDirty = 0;
 		for (i = 0; i < 16; ++i) {
 			UMidiFifoPush(ctx, 0xb0 | i);
 			UMidiFifoPush(ctx, 0x07);
@@ -300,7 +304,7 @@ fifo_full:
 	 * already set this asserts the ACIA IRQ at once (falling edge on
 	 * GPIP I4), so transmission starts right after we return. */
 	if (ctx->fifoHead != ctx->fifoTail && !ctx->tie) {
-		ctx->tie = SDL_TRUE;
+		ctx->tie = 1;
 		UMIDI_ACIA_CTRL = UMIDI_ACIA_CTRL_TIE_ON;
 	}
 
@@ -309,7 +313,7 @@ fifo_full:
 
 /* private SDL API (src/video/ataricommon/SDL_atarixbra.c) */
 typedef void (*UMidiXbraHandler)(void);
-extern UMidiXbraHandler Atari_UnhookXbra(Uint32 vecnum, Uint32 app_id, UMidiXbraHandler handler);
+extern UMidiXbraHandler Atari_UnhookXbra(uint32_t vecnum, uint32_t app_id, UMidiXbraHandler handler);
 
 #define UMIDI_XBRA_ID			0x4C53444DUL	/* 'LSDM' */
 
@@ -331,7 +335,7 @@ void UMidiAciaHook(void) {
 			/* nothing to send: disable the ACIA transmit interrupt,
 			 * UMidiTimerHandler() enables it again */
 			UMIDI_ACIA_CTRL = UMIDI_ACIA_CTRL_TIE_OFF;
-			ctx->tie = SDL_FALSE;
+			ctx->tie = 0;
 		}
 	}
 }
@@ -368,13 +372,13 @@ __asm__(
 
 static long UMidiInstallHooks(void) {
 	UMidiContext *ctx = UMidiActiveContext;
-	Uint16 sr = UMidiDisableInterrupts();
+	uint16_t sr = UMidiDisableInterrupts();
 
 	ctx->oldTbcr = UMIDI_MFP_TBCR;
 	ctx->oldTimerbEnabled	= (UMIDI_MFP_IERA & (1 << 0)) != 0;
 	ctx->oldTimerbMasked	= (UMIDI_MFP_IMRA & (1 << 0)) != 0;
 
-	ctx->tie = SDL_FALSE;
+	ctx->tie = 0;
 	UMIDI_ACIA_CTRL = UMIDI_ACIA_CTRL_TIE_OFF;
 
 	if ((UMidiXbraHandler)ctx->kbdvecs->midisys != UMidiSysHandler) {
@@ -387,7 +391,7 @@ static long UMidiInstallHooks(void) {
 	return 0;
 }
 
-static void UMidiSendPolled(Uint8 b) {
+static void UMidiSendPolled(uint8_t b) {
 	while ((UMIDI_ACIA_CTRL & UMIDI_ACIA_TDRE) == 0)
 		;
 	UMIDI_ACIA_DATA = b;
@@ -395,13 +399,13 @@ static void UMidiSendPolled(Uint8 b) {
 
 static long UMidiRemoveHooks(void) {
 	UMidiContext *ctx = UMidiActiveContext;
-	Uint16 sr;
+	uint16_t sr;
 	int i;
 
 	/* order matters: hardware TIE off first, only then the shadow */
 	sr = UMidiDisableInterrupts();
 	UMIDI_ACIA_CTRL = UMIDI_ACIA_CTRL_TIE_OFF;
-	ctx->tie = SDL_FALSE;
+	ctx->tie = 0;
 	UMidiRestoreInterrupts(sr);
 
 	/* Silence every channel (TIE is off, so polled sending cannot race
@@ -419,10 +423,10 @@ static long UMidiRemoveHooks(void) {
 
 	sr = UMidiDisableInterrupts();
 
-	Atari_UnhookXbra((Uint32)&ctx->kbdvecs->midisys, UMIDI_XBRA_ID, UMidiSysHandler);
+	Atari_UnhookXbra((uint32_t)&ctx->kbdvecs->midisys, UMIDI_XBRA_ID, UMidiSysHandler);
 
 	UMIDI_MFP_TBCR = ctx->oldTbcr;
-	UMIDI_MFP_IPRA = (Uint8)~(1 << 0);	/* discard a pending tick of ours */
+	UMIDI_MFP_IPRA = (uint8_t)~(1 << 0);	/* discard a pending tick of ours */
 	if (ctx->oldTimerbEnabled)
 		UMIDI_MFP_IERA |= 1 << 0;
 	if (ctx->oldTimerbMasked)
@@ -435,7 +439,7 @@ static long UMidiRemoveHooks(void) {
 
 UMIDI_DEF int UMidiOpen(UMidiContext* ctx) {
 	memset(ctx, 0, sizeof(*ctx));
-	ctx->volume = MIX_MAX_VOLUME;
+	ctx->volume = UMIDI_MAX_VOLUME;
 
 	return 1;
 }
@@ -471,7 +475,7 @@ UMIDI_DEF void UMidiPlay(UMidiContext* ctx, NativeMidiSong* song, int loops) {
 	ctx->currentSong = song;
 
 	Jdisint(MFP_TIMERB);
-	ctx->oldTimerbVec = (Uint32)Setexc(0x120>>2, -1);
+	ctx->oldTimerbVec = (uint32_t)Setexc(0x120>>2, -1);
 	Xbtimer(XB_TIMERB, UMIDI_TIMER_B_CTRL, UMIDI_TIMER_B_DATA, UMidiTimerHandler);
 }
 
@@ -496,11 +500,11 @@ UMIDI_DEF int UMidiIsPlaying(const UMidiContext* ctx) {
 UMIDI_DEF void UMidiSetVolume(UMidiContext* ctx, int volume) {
 	if (volume < 0)
 		volume = 0;
-	else if (volume > MIX_MAX_VOLUME)
-		volume = MIX_MAX_VOLUME;
+	else if (volume > UMIDI_MAX_VOLUME)
+		volume = UMIDI_MAX_VOLUME;
 
 	ctx->volume = volume;
-	ctx->volDirty = SDL_TRUE;
+	ctx->volDirty = 1;
 }
 
 static UMidiContext s_ctx;
