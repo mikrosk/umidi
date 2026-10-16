@@ -35,9 +35,12 @@
 #define UMIDI_FIFO_SIZE			2048		/* power of two */
 #define UMIDI_FIFO_MASK			(UMIDI_FIFO_SIZE - 1)
 
+/* timer periods per second, the unit of block times */
+#define UMIDI_TIMER_HZ 960
+
 /* MIDI messages to be sent at the same time */
 typedef struct {
-	uint32_t time;	/* microseconds from the song start */
+	uint32_t time;	/* timer periods from the song start */
 	uint32_t end;	/* offset just past the last byte of the block in the song data */
 } UMidiBlock;
 
@@ -58,9 +61,7 @@ typedef struct {
 	uint32_t curPos;					/* offset of the next message to queue */
 	volatile int loops;
 
-	/* song position in microseconds and its 16-bit fraction */
-	uint32_t now;
-	uint32_t nowFrac;
+	uint32_t now;						/* song position in timer periods */
 
 	void (* volatile tickCallback)(void);
 	volatile uint32_t tickAdd;			/* ticks per timer period, 16.16 fixed point */
@@ -104,13 +105,13 @@ UMIDI_DEF void UMidiUnlock(UMidiContext* ctx);
 /*
  * Two interrupt sources, one FIFO between them:
  *
- * 1. Timer B is the PRODUCER, running at a constant 960 Hz (2457600 /
- *    16 / 160), i.e. ~1 ms timing resolution, with one of two
- *    interrupts installed:
+ * 1. Timer B is the PRODUCER, running at a constant UMIDI_TIMER_HZ:
+ *    960 Hz (2457600 / 16 / 160), i.e. ~1 ms timing resolution, with
+ *    one of two interrupts installed:
  *
  *    The player interrupt advances the song position by one timer
  *    period and pushes the messages of the blocks that became due into
- *    the FIFO. Block times are in microseconds, so tempo changes are
+ *    the FIFO. Block times are in timer periods, so tempo changes are
  *    already part of them. While the FIFO is full, due blocks wait and
  *    then go out in a burst; the song position keeps advancing.
  *
@@ -161,13 +162,9 @@ UMIDI_DEF void UMidiUnlock(UMidiContext* ctx);
 #define UMIDI_TIMER_B_CTRL		3		/* prescaler /16 */
 #define UMIDI_TIMER_B_PRESCALER	16
 #define UMIDI_TIMER_B_DATA		160		/* 2457600/16/160 = 960 Hz */
-
-/* Timer B period in microseconds, 16.16 fixed point */
-#define UMIDI_TIMER_B_PERIOD	((uint32_t)((65536ULL \
-									* UMIDI_TIMER_B_PRESCALER \
-									* UMIDI_TIMER_B_DATA \
-									* 1000000 \
-									+ UMIDI_MFP_CLOCK/2) / UMIDI_MFP_CLOCK))
+#if UMIDI_TIMER_HZ * UMIDI_TIMER_B_PRESCALER * UMIDI_TIMER_B_DATA != UMIDI_MFP_CLOCK
+#error "UMIDI_TIMER_HZ doesn't match the Timer B rate"
+#endif
 
 /* ticks per minute to ticks per timer period, 16.16 fixed point:
  * 65536 * prescaler * data / (60 * MFP clock), reduced to fit in 32 bits */
@@ -270,9 +267,7 @@ static void __attribute__((interrupt)) UMidiPlayerInterrupt(void) {
 		goto transmit;
 
 	/* advance song position */
-	ctx->nowFrac += UMIDI_TIMER_B_PERIOD & 0xffff;
-	ctx->now += (UMIDI_TIMER_B_PERIOD >> 16) + (ctx->nowFrac >> 16);
-	ctx->nowFrac &= 0xffff;
+	ctx->now++;
 
 	/* queue due blocks */
 	for (;;) {
@@ -288,7 +283,6 @@ static void __attribute__((interrupt)) UMidiPlayerInterrupt(void) {
 			ctx->curBlock	= song->loopBlock;
 			ctx->curPos		= song->loopBlock ? song->blocks[song->loopBlock - 1].end : 0;
 			ctx->now		= song->blocks[song->loopBlock].time;
-			ctx->nowFrac	= 0;
 		}
 
 		if (song->blocks[ctx->curBlock].time > ctx->now)
@@ -584,7 +578,6 @@ UMIDI_DEF void UMidiPlay(UMidiContext* ctx, const UMidiSong* song, int loops) {
 	ctx->curBlock	= 0;
 	ctx->curPos		= 0;
 	ctx->now		= 0;
-	ctx->nowFrac	= 0;
 
 	for (i = 0; i < 16; ++i)
 		ctx->lastCC7[i] = UMIDI_DEFAULT_CC7;
