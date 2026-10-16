@@ -83,12 +83,8 @@ typedef struct {
 } UMidiContext;
 
 #ifndef UMIDI_DEF
-#ifdef __GNUC__
 /* a translation unit doesn't have to use all of them */
 #define UMIDI_DEF	static __attribute__((__unused__))
-#else
-#define UMIDI_DEF	static
-#endif
 #endif	/* UMIDI_DEF */
 
 UMIDI_DEF int UMidiOpen(UMidiContext* ctx);
@@ -311,20 +307,35 @@ fifo_full:
 	UMIDI_MFP_ISRA = ~(1 << 0);	/* clear in service bit */
 }
 
-/* private SDL API (src/video/ataricommon/SDL_atarixbra.c) */
-typedef void (*UMidiXbraHandler)(void);
-extern UMidiXbraHandler Atari_UnhookXbra(uint32_t vecnum, uint32_t app_id, UMidiXbraHandler handler);
+#define UMIDI_XBRA_MAGIC		0x58425241L		/* 'XBRA' */
+#define UMIDI_XBRA_ID			0x754D4944L		/* 'uMID' */
 
-#define UMIDI_XBRA_ID			0x4C53444DUL	/* 'LSDM' */
+/* XBRA header in front of a system vector routine, linking the routines
+ * installed on the vector */
+typedef struct {
+	long magic;
+	long id;
+	long (*old)(void);
+} UMidiXbra;
 
-extern void UMidiSysHandler(void);
-extern UMidiXbraHandler UMidiSysOldVec;
+#if !defined(__GNUC__) || __GNUC__ < 8
+#error "patchable_function_entry needs GCC 8 or newer"
+#endif
 
 /* kb_midisys hook: called (jsr, supervisor) by the TOS $118 handler on
  * every ACIA interrupt, in a loop until the interrupt line is released.
  * Send one byte per TDRE, disarm TIE the moment the FIFO runs dry --
- * leaving TIE armed with nothing to send would hang the midikey loop. */
-void UMidiAciaHook(void) {
+ * leaving TIE armed with nothing to send would hang the midikey loop.
+ * Then the previous routine gets the receive side.
+ *
+ * The compiler leaves room for the XBRA header right in front of the
+ * routine (two bytes per NOP), UMidiInstallHooks() fills it in.
+ *
+ * No specification defines which registers a kbdvecs routine may
+ * clobber, but both Atari TOS and EmuTOS save d0-d3/a0-a3 around these
+ * calls, and a C function clobbers no more than d0-d2/a0-a1 (d2 is a
+ * scratch register with -mfastcall). */
+static void __attribute__((patchable_function_entry(sizeof(UMidiXbra) / 2, sizeof(UMidiXbra) / 2))) UMidiSysHandler(void) {
 	UMidiContext *ctx = UMidiActiveContext;
 
 	if (ctx->tie && (UMIDI_ACIA_CTRL & UMIDI_ACIA_TDRE)) {
@@ -338,37 +349,13 @@ void UMidiAciaHook(void) {
 			ctx->tie = 0;
 		}
 	}
+
+	((UMidiXbra *)((long)UMidiSysHandler - (long)sizeof(UMidiXbra)))->old();
 }
 
-#define UMIDI_STR_(x)			#x
-#define UMIDI_STR(x)			UMIDI_STR_(x)
-#define UMIDI_SYM(x)			UMIDI_STR(__USER_LABEL_PREFIX__) #x
-
-/*
- * kb_midisys entry with an XBRA header: calls the C handler for the
- * transmit side, then jumps to the previous vector for the receive
- * side.
- *
- * No specification defines which registers a kbdvecs routine may
- * clobber, but both Atari TOS and EmuTOS save d0-d3/a0-a3 around these
- * calls. This handler clobbers only d0-d1/a0-a1 (C call) plus a0
- * (chain jump), so nothing has to be saved here under either reading.
- */
-__asm__(
-	"\n" "	.pushsection	.text"
-	"\n" "	.even"
-	"\n" "	.globl	" UMIDI_SYM(UMidiSysOldVec)
-	"\n" "	.globl	" UMIDI_SYM(UMidiSysHandler)
-	"\n" "	.ascii	\"XBRA\""
-	"\n" "	.ascii	\"LSDM\""
-	"\n" UMIDI_SYM(UMidiSysOldVec) ":"
-	"\n" "	.long	0"
-	"\n" UMIDI_SYM(UMidiSysHandler) ":"
-	"\n" "	jsr		" UMIDI_SYM(UMidiAciaHook)
-	"\n" "	move.l	" UMIDI_SYM(UMidiSysOldVec) ",%a0"
-	"\n" "	jmp		(%a0)"
-	"\n" "	.popsection"
-	"\n");
+static UMidiXbra *UMidiSysXbra(void) {
+	return (UMidiXbra *)((long)UMidiSysHandler - (long)sizeof(UMidiXbra));
+}
 
 static long UMidiInstallHooks(void) {
 	UMidiContext *ctx = UMidiActiveContext;
@@ -381,8 +368,12 @@ static long UMidiInstallHooks(void) {
 	ctx->tie = 0;
 	UMIDI_ACIA_CTRL = UMIDI_ACIA_CTRL_TIE_OFF;
 
-	if ((UMidiXbraHandler)ctx->kbdvecs->midisys != UMidiSysHandler) {
-		UMidiSysOldVec = (UMidiXbraHandler)ctx->kbdvecs->midisys;
+	if ((long)ctx->kbdvecs->midisys != (long)UMidiSysHandler) {
+		UMidiXbra *xbra = UMidiSysXbra();
+
+		xbra->magic = UMIDI_XBRA_MAGIC;
+		xbra->id = UMIDI_XBRA_ID;
+		xbra->old = ctx->kbdvecs->midisys;
 		ctx->kbdvecs->midisys = (long (*)(void))UMidiSysHandler;
 	}
 
@@ -400,6 +391,7 @@ static void UMidiSendPolled(uint8_t b) {
 static long UMidiRemoveHooks(void) {
 	UMidiContext *ctx = UMidiActiveContext;
 	uint16_t sr;
+	long *link;
 	int i;
 
 	/* order matters: hardware TIE off first, only then the shadow */
@@ -423,7 +415,20 @@ static long UMidiRemoveHooks(void) {
 
 	sr = UMidiDisableInterrupts();
 
-	Atari_UnhookXbra((uint32_t)&ctx->kbdvecs->midisys, UMIDI_XBRA_ID, UMidiSysHandler);
+	/* unlink the hook from the XBRA chain of kb_midisys */
+	link = (long *)&ctx->kbdvecs->midisys;
+	while (*link) {
+		UMidiXbra *xbra;
+
+		if (*link == (long)UMidiSysHandler) {
+			*link = (long)UMidiSysXbra()->old;
+			break;
+		}
+		xbra = (UMidiXbra *)(*link - (long)sizeof(UMidiXbra));
+		if (xbra->magic != UMIDI_XBRA_MAGIC)
+			break;
+		link = (long *)&xbra->old;
+	}
 
 	UMIDI_MFP_TBCR = ctx->oldTbcr;
 	UMIDI_MFP_IPRA = (uint8_t)~(1 << 0);	/* discard a pending tick of ours */
