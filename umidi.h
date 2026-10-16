@@ -74,6 +74,7 @@ typedef struct {
 	uint32_t tickFrac;					/* due ticks, 16.16 fixed point; whole ones wait for FIFO space */
 
 	volatile int locked;				/* nothing is queued while non-zero */
+	int waitStart;						/* the song or the tick callback starts once the FIFO is empty */
 
 	volatile uint8_t fifo[UMIDI_FIFO_SIZE];
 	volatile uint16_t fifoHead, fifoTail;
@@ -130,7 +131,9 @@ UMIDI_DEF void UMidiUnlock(UMidiContext* ctx);
  *    Once nothing plays and the FIFO is empty, the timer disables its
  *    own interrupt. While locked, neither interrupt queues anything;
  *    the song position keeps advancing, the tick interrupt's time
- *    stands still.
+ *    stands still. Stopping queues messages silencing all channels;
+ *    a song or the tick callback started before they are sent begins
+ *    once they are.
  *
  * 2. The MIDI ACIA transmit interrupt is the CONSUMER, draining the
  *    FIFO at wire speed (31250 baud / 10 bits = 3125 bytes/s), one
@@ -284,8 +287,8 @@ static __inline__ void UMidiTransmit(UMidiContext *ctx, int idle) {
 	}
 	if (ctx->fifoHead == ctx->fifoTail && idle) {
 		/* nothing to send and nothing to do: disable the Timer B
-		 * interrupt; UMidiPlay(), UMidiStartTicks() and UMidiSend()
-		 * enable it again */
+		 * interrupt; UMidiPlay(), UMidiStartTicks(), UMidiSend() and
+		 * stopping enable it again */
 		UMIDI_MFP_IERA &= (uint8_t)~(1 << 0);
 	}
 }
@@ -298,9 +301,14 @@ static void __attribute__((interrupt)) UMidiPlayerHandler(void) {
 	const UMidiSong *song = ctx->song;
 	int looped = 0;
 
-	if (!song || ctx->locked) {
+	if (song && ctx->waitStart && ctx->fifoHead == ctx->fifoTail) {
+		/* the data queued before the song is sent: it starts now */
+		ctx->waitStart = 0;
+		ctx->now = 0;
+	}
+	if (!song || ctx->locked || ctx->waitStart) {
 		/* again at the next period: until the timer interrupt disables
-		 * itself, or the lock is released */
+		 * itself, the lock is released or the song starts */
 		ctx->due = ctx->now + 1;
 		goto transmit;
 	}
@@ -413,7 +421,12 @@ static void __attribute__((__interrupt__, __no_instrument_function__, __optimize
 static void __attribute__((interrupt)) UMidiTickInterrupt(void) {
 	UMidiContext *ctx = UMidiActiveContext;
 
-	if (ctx->tickCallback && !ctx->locked) {
+	/* time stands still until the data queued before the callback is
+	 * sent */
+	if (ctx->waitStart && ctx->fifoHead == ctx->fifoTail)
+		ctx->waitStart = 0;
+
+	if (ctx->tickCallback && !ctx->locked && !ctx->waitStart) {
 		ctx->tickFrac += ctx->tickAdd;
 		while (ctx->tickFrac >= 0x10000) {
 			/* the tick waits until its messages fit */
@@ -541,25 +554,30 @@ static long UMidiUnhookMidisys(void) {
 	return 0;
 }
 
-/* Silence every channel and reset its controllers through the XBIOS,
- * which never writes the ACIA control register. A status byte aborts a
- * possibly half-transmitted message, so the stream stays parseable. */
-static void UMidiSilence(void) {
-	uint8_t msg[16 * 9];
+/* Queue messages silencing every channel and resetting its controllers,
+ * once nothing else queues data. A status byte aborts a possibly
+ * half-transmitted message, so the stream stays parseable. */
+static void UMidiSilence(UMidiContext *ctx) {
 	int i;
 
+	while (UMidiFifoSpace(ctx) < 16 * 9)
+		;
 	for (i = 0; i < 16; ++i) {
-		msg[i * 9 + 0] = 0xb0 | i;
-		msg[i * 9 + 1] = 0x78;	/* All Sound Off */
-		msg[i * 9 + 2] = 0x00;
-		msg[i * 9 + 3] = 0xb0 | i;
-		msg[i * 9 + 4] = 0x7b;	/* All Notes Off */
-		msg[i * 9 + 5] = 0x00;
-		msg[i * 9 + 6] = 0xb0 | i;
-		msg[i * 9 + 7] = 0x79;	/* Reset All Controllers */
-		msg[i * 9 + 8] = 0x00;
+		UMidiFifoPush(ctx, 0xb0 | i);
+		UMidiFifoPush(ctx, 0x78);	/* All Sound Off */
+		UMidiFifoPush(ctx, 0x00);
+		UMidiFifoPush(ctx, 0xb0 | i);
+		UMidiFifoPush(ctx, 0x7b);	/* All Notes Off */
+		UMidiFifoPush(ctx, 0x00);
+		UMidiFifoPush(ctx, 0xb0 | i);
+		UMidiFifoPush(ctx, 0x79);	/* Reset All Controllers */
+		UMidiFifoPush(ctx, 0x00);
 	}
-	Midiws(sizeof(msg) - 1, msg);
+
+	/* the timer interrupt sends them from the next period on and may
+	 * have disabled itself */
+	ctx->due = 0;
+	Jenabint(MFP_TIMERB);
 }
 
 UMIDI_DEF int UMidiOpen(UMidiContext* ctx) {
@@ -608,6 +626,10 @@ UMIDI_DEF void UMidiClose(UMidiContext* ctx) {
 	UMidiStop(ctx);
 	UMidiStopTicks(ctx);
 
+	/* the interrupts send the rest */
+	while (ctx->fifoHead != ctx->fifoTail || ctx->tie)
+		;
+
 	/* stop Timer B and put its previous vector back; Xbtimer() enables
 	 * the interrupt, so it's disabled afterwards */
 	Xbtimer(XB_TIMERB, 0, 0, ctx->oldTimerbVec);
@@ -626,11 +648,9 @@ UMIDI_DEF int UMidiSend(UMidiContext* ctx, const uint8_t* msg, uint16_t length) 
 	if (!length)
 		return 1;
 
-	if (!ctx->song && !ctx->tickCallback) {
-		/* nothing else queues data: send at once through the XBIOS, once
-		 * the TX interrupt has sent the rest and turned itself off */
-		while (ctx->fifoHead != ctx->fifoTail || ctx->tie)
-			;
+	if (!ctx->song && !ctx->tickCallback && ctx->fifoHead == ctx->fifoTail && !ctx->tie) {
+		/* nothing else queues or sends data: send at once through the
+		 * XBIOS */
 		Midiws(length - 1, msg);
 		return 1;
 	}
@@ -646,12 +666,11 @@ UMIDI_DEF int UMidiSend(UMidiContext* ctx, const uint8_t* msg, uint16_t length) 
 	--ctx->locked;
 
 	/* the player's timer interrupt has to run at the next period to arm
-	 * the TX interrupt, and may have disabled itself; the tick interrupt
-	 * runs as long as the callback is set */
-	if (ctx->song) {
-		ctx->due = 0;
+	 * the TX interrupt; the timer interrupt may have disabled itself,
+	 * unless it is the tick interrupt with the callback set */
+	ctx->due = 0;
+	if (!ctx->tickCallback)
 		Jenabint(MFP_TIMERB);
-	}
 
 	return 1;
 }
@@ -675,6 +694,7 @@ UMIDI_DEF void UMidiPlay(UMidiContext* ctx, const UMidiSong* song, int loops) {
 		ctx->lastCC7[i] = UMIDI_DEFAULT_CC7;
 
 	ctx->loops = loops;	/* number of repeats after the first pass; -1 = forever */
+	ctx->waitStart = ctx->fifoHead != ctx->fifoTail;
 
 	/* compiler barrier: all of the song is stored before the pointer the
 	 * timer interrupt checks */
@@ -687,14 +707,12 @@ UMIDI_DEF void UMidiStop(UMidiContext* ctx) {
 	if (!ctx->song)
 		return;
 
-	/* drop the queue: nothing queues data any more, and the TX interrupt
-	 * can't split this store; it turns itself off on the empty FIFO */
+	/* drop the queue for the silence: nothing else queues data any more,
+	 * and the TX interrupt can't split this store */
 	ctx->song = NULL;
 	ctx->fifoTail = ctx->fifoHead;
-	while (ctx->tie)
-		;
 
-	UMidiSilence();
+	UMidiSilence(ctx);
 }
 
 UMIDI_DEF int UMidiIsPlaying(const UMidiContext* ctx) {
@@ -722,6 +740,7 @@ UMIDI_DEF void UMidiStartTicks(UMidiContext* ctx, void (*callback)(void)) {
 	UMidiStopTicks(ctx);
 
 	ctx->tickFrac = 0;
+	ctx->waitStart = ctx->fifoHead != ctx->fifoTail;
 
 	/* compiler barrier: all of the above is stored before the pointer the
 	 * timer interrupt checks */
@@ -738,13 +757,10 @@ UMIDI_DEF void UMidiStopTicks(UMidiContext* ctx) {
 	if (!ctx->tickCallback)
 		return;
 
-	/* no further data is queued; the TX interrupt sends the rest and
-	 * turns itself off */
+	/* no further data is queued; the silence follows the rest */
 	ctx->tickCallback = NULL;
-	while (ctx->fifoHead != ctx->fifoTail || ctx->tie)
-		;
 
-	UMidiSilence();
+	UMidiSilence(ctx);
 }
 
 UMIDI_DEF void UMidiLock(UMidiContext* ctx) {
