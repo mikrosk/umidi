@@ -46,34 +46,36 @@ struct _NativeMidiSong {
 	Uint16 ticksPerQuarterNote; /* 48 by default (independent of the tempo) */
 };
 
-/* Only one song plays at a time; the playback state lives here and not
- * in NativeMidiSong. */
-static NativeMidiSong * volatile s_currentSong;	/* NULL when stopped */
-static MIDIEvent *s_events;						/* next event to schedule */
-static Uint32 s_ticksPerQuarterNote;
-static int s_loops;
+typedef struct {
+	/* Only one song plays at a time; the playback state lives here and not
+	 * in NativeMidiSong. */
+	NativeMidiSong * volatile currentSong;	/* NULL when stopped */
+	MIDIEvent *events;						/* next event to schedule */
+	Uint32 ticksPerQuarterNote;
+	int loops;
 
-/* 16.16 fixed point: upper 16 bits integer part, lower 16 bits fraction.
- * Every timer interrupt executes s_tickFrac += s_tickAdd; whenever
- * s_tickFrac crosses 1.0, the whole part moves into s_tickInt and only
- * the fraction stays. */
-static Uint32 s_tickAdd;
-static Uint32 s_tickFrac;
-static Uint32 s_tickInt;
+	/* 16.16 fixed point: upper 16 bits integer part, lower 16 bits fraction.
+	 * Every timer interrupt executes tickFrac += tickAdd; whenever
+	 * tickFrac crosses 1.0, the whole part moves into tickInt and only
+	 * the fraction stays. */
+	Uint32 tickAdd;
+	Uint32 tickFrac;
+	Uint32 tickInt;
 
-static Uint8 s_fifo[UMIDI_FIFO_SIZE];
-static volatile Uint16 s_fifoHead, s_fifoTail;
+	Uint8 fifo[UMIDI_FIFO_SIZE];
+	volatile Uint16 fifoHead, fifoTail;
 
-static Uint8 s_lastCC7[16];			/* channel volume as sent by the song */
-static volatile Uint8 s_volume = MIX_MAX_VOLUME;	/* master volume */
-static volatile SDL_bool s_volDirty;		/* set by native_midi_setvolume(), consumed by the producer */
+	Uint8 lastCC7[16];				/* channel volume as sent by the song */
+	volatile Uint8 volume;			/* master volume */
+	volatile SDL_bool volDirty;		/* set by native_midi_setvolume(), consumed by the producer */
 
-static volatile SDL_bool s_tie;		/* shadow: is the TX interrupt enabled? */
-static _KBDVECS *s_kbdvecs;
+	volatile SDL_bool tie;			/* shadow: is the TX interrupt enabled? */
+	_KBDVECS *kbdvecs;
 
-static Uint32 s_oldTimerbVec;
-static Uint8 s_oldTbcr;
-static SDL_bool s_oldTimerbEnabled, s_oldTimerbMasked;
+	Uint32 oldTimerbVec;
+	Uint8 oldTbcr;
+	SDL_bool oldTimerbEnabled, oldTimerbMasked;
+} UMidiContext;
 
 #ifndef UMIDI_DEF
 #ifdef __GNUC__
@@ -113,10 +115,10 @@ static SDL_bool s_oldTimerbEnabled, s_oldTimerbMasked;
  * Volume: a MIDI song controls 16 channel volumes (controller 7) but
  * the wire has no master volume, so native_midi_setvolume() (called
  * from music.c for Mix_VolumeMusic() and for fades) implements one by
- * scaling. s_lastCC7[] holds each channel volume as the song last set
+ * scaling. lastCC7[] holds each channel volume as the song last set
  * it: the producer updates it from controller 7 events and transmits
- * s_lastCC7[channel] * s_volume / MIX_MAX_VOLUME. native_midi_setvolume()
- * stores s_volume, sets s_volDirty and returns; the producer then queues
+ * lastCC7[channel] * volume / MIX_MAX_VOLUME. native_midi_setvolume()
+ * stores volume, sets volDirty and returns; the producer then queues
  * controller 7 messages with the recomputed values for all 16 channels.
  */
 
@@ -149,6 +151,9 @@ static SDL_bool s_oldTimerbEnabled, s_oldTimerbMasked;
 #define UMIDI_DEFAULT_TEMPO		500000UL	/* us per quarter note (120 bpm) */
 #define UMIDI_DEFAULT_CC7		100			/* GM default channel volume */
 
+/* the interrupt handlers and Supexec() routines take no arguments */
+static UMidiContext *UMidiActiveContext;
+
 static __inline__ Uint16 UMidiDisableInterrupts(void) {
 	Uint16 sr;
 #ifdef __mcoldfire__
@@ -165,43 +170,44 @@ static __inline__ void UMidiRestoreInterrupts(Uint16 sr) {
 	__asm__ volatile ("move.w %0,%%sr" : : "d"(sr) : "memory");
 }
 
-static __inline__ Uint8 UMidiScaledVolume(Uint8 chan) {
-	return (Uint16)(s_lastCC7[chan] * s_volume) / MIX_MAX_VOLUME;
+static __inline__ Uint8 UMidiScaledVolume(const UMidiContext *ctx, Uint8 chan) {
+	return (Uint16)(ctx->lastCC7[chan] * ctx->volume) / MIX_MAX_VOLUME;
 }
 
-static __inline__ Uint16 UMidiFifoSpace(void) {
-	return UMIDI_FIFO_SIZE - 1 - ((s_fifoHead - s_fifoTail) & UMIDI_FIFO_MASK);
+static __inline__ Uint16 UMidiFifoSpace(const UMidiContext *ctx) {
+	return UMIDI_FIFO_SIZE - 1 - ((ctx->fifoHead - ctx->fifoTail) & UMIDI_FIFO_MASK);
 }
 
-static __inline__ void UMidiFifoPush(Uint8 b) {
-	s_fifo[s_fifoHead] = b;
-	s_fifoHead = (s_fifoHead + 1) & UMIDI_FIFO_MASK;
+static __inline__ void UMidiFifoPush(UMidiContext *ctx, Uint8 b) {
+	ctx->fifo[ctx->fifoHead] = b;
+	ctx->fifoHead = (ctx->fifoHead + 1) & UMIDI_FIFO_MASK;
 }
 
 /* Returns how many MIDI ticks elapse during one timer period, as 16.16
  * fixed point: 65536 * ticksPerQuarterNote * period_us / tempo_us. */
-static __inline__ Uint32 UMidiTicksPerPeriod(Uint32 tempo) {
+static __inline__ Uint32 UMidiTicksPerPeriod(const UMidiContext *ctx, Uint32 tempo) {
 	Uint32 q, r;
 
 	q = UMIDI_TICK_NUMER / tempo;
 	r = UMIDI_TICK_NUMER % tempo;
 
-	return s_ticksPerQuarterNote * q
-		+ (s_ticksPerQuarterNote * r + tempo / 2) / tempo;
+	return ctx->ticksPerQuarterNote * q
+		+ (ctx->ticksPerQuarterNote * r + tempo / 2) / tempo;
 }
 
 /* Producer: schedule due events into the FIFO, arm the ACIA TX interrupt */
 static void __attribute__((interrupt)) UMidiTimerHandler(void) {
+	UMidiContext *ctx = UMidiActiveContext;
 	MIDIEvent *ev;
 
 	/* advance song position */
-	s_tickFrac += s_tickAdd;
-	s_tickInt += s_tickFrac >> 16;
-	s_tickFrac &= 0xffff;
+	ctx->tickFrac += ctx->tickAdd;
+	ctx->tickInt += ctx->tickFrac >> 16;
+	ctx->tickFrac &= 0xffff;
 
 	/* schedule due events */
-	ev = s_events;
-	while (ev && ev->time <= s_tickInt) {
+	ev = ctx->events;
+	while (ev && ev->time <= ctx->tickInt) {
 		const Uint8 status = ev->status;
 
 		if (status == 0xff) {
@@ -212,22 +218,22 @@ static void __attribute__((interrupt)) UMidiTimerHandler(void) {
 							| ((Uint32)ev->extraData[1] << 8)
 							| (Uint32)ev->extraData[2];
 				if (tempo)
-					s_tickAdd = UMidiTicksPerPeriod(tempo);
+					ctx->tickAdd = UMidiTicksPerPeriod(ctx, tempo);
 			}
 			/* 0x2f (end of track) and the rest are ignored;
 			 * end of song == end of the event list */
 		} else {
 			switch (status >> 4) {
 				case MIDI_STATUS_CONTROLLER:
-					if (UMidiFifoSpace() < 3)
+					if (UMidiFifoSpace(ctx) < 3)
 						goto fifo_full;
 					if (ev->data[0] == 0x07) {
 						/* Channel volume: remember it and send it scaled
 						 * by the master volume */
-						s_lastCC7[status & 0x0f] = ev->data[1];
-						UMidiFifoPush(status);
-						UMidiFifoPush(0x07);
-						UMidiFifoPush(UMidiScaledVolume(status & 0x0f));
+						ctx->lastCC7[status & 0x0f] = ev->data[1];
+						UMidiFifoPush(ctx, status);
+						UMidiFifoPush(ctx, 0x07);
+						UMidiFifoPush(ctx, UMidiScaledVolume(ctx, status & 0x0f));
 						break;
 					}
 					/* fall through */
@@ -235,19 +241,19 @@ static void __attribute__((interrupt)) UMidiTimerHandler(void) {
 				case MIDI_STATUS_NOTE_ON:
 				case MIDI_STATUS_AFTERTOUCH:
 				case MIDI_STATUS_PITCH_WHEEL:
-					if (UMidiFifoSpace() < 3)
+					if (UMidiFifoSpace(ctx) < 3)
 						goto fifo_full;
-					UMidiFifoPush(status);
-					UMidiFifoPush(ev->data[0]);
-					UMidiFifoPush(ev->data[1]);
+					UMidiFifoPush(ctx, status);
+					UMidiFifoPush(ctx, ev->data[0]);
+					UMidiFifoPush(ctx, ev->data[1]);
 					break;
 
 				case MIDI_STATUS_PROG_CHANGE:
 				case MIDI_STATUS_PRESSURE:
-					if (UMidiFifoSpace() < 2)
+					if (UMidiFifoSpace(ctx) < 2)
 						goto fifo_full;
-					UMidiFifoPush(status);
-					UMidiFifoPush(ev->data[0]);
+					UMidiFifoPush(ctx, status);
+					UMidiFifoPush(ctx, ev->data[0]);
 					break;
 
 				default:
@@ -259,35 +265,35 @@ static void __attribute__((interrupt)) UMidiTimerHandler(void) {
 		ev = ev->next;
 	}
 fifo_full:
-	s_events = ev;
+	ctx->events = ev;
 
-	if (!ev && s_loops) {
-		if (s_loops > 0)
-			s_loops--;
+	if (!ev && ctx->loops) {
+		if (ctx->loops > 0)
+			ctx->loops--;
 
-		s_events	= s_currentSong->firstEvent;
-		s_tickAdd	= UMidiTicksPerPeriod(UMIDI_DEFAULT_TEMPO);
-		s_tickFrac	= 0;
-		s_tickInt	= 0;
+		ctx->events		= ctx->currentSong->firstEvent;
+		ctx->tickAdd	= UMidiTicksPerPeriod(ctx, UMIDI_DEFAULT_TEMPO);
+		ctx->tickFrac	= 0;
+		ctx->tickInt	= 0;
 	}
 
 	/* Master volume change: resend the scaled channel volumes */
-	if (s_volDirty && UMidiFifoSpace() >= 16 * 3) {
+	if (ctx->volDirty && UMidiFifoSpace(ctx) >= 16 * 3) {
 		int i;
 
-		s_volDirty = SDL_FALSE;
+		ctx->volDirty = SDL_FALSE;
 		for (i = 0; i < 16; ++i) {
-			UMidiFifoPush(0xb0 | i);
-			UMidiFifoPush(0x07);
-			UMidiFifoPush(UMidiScaledVolume(i));
+			UMidiFifoPush(ctx, 0xb0 | i);
+			UMidiFifoPush(ctx, 0x07);
+			UMidiFifoPush(ctx, UMidiScaledVolume(ctx, i));
 		}
 	}
 
 	/* bytes queued and TX interrupt not armed: arm it. If TDRE is
 	 * already set this asserts the ACIA IRQ at once (falling edge on
 	 * GPIP I4), so transmission starts right after we return. */
-	if (s_fifoHead != s_fifoTail && !s_tie) {
-		s_tie = SDL_TRUE;
+	if (ctx->fifoHead != ctx->fifoTail && !ctx->tie) {
+		ctx->tie = SDL_TRUE;
 		UMIDI_ACIA_CTRL = UMIDI_ACIA_CTRL_TIE_ON;
 	}
 
@@ -308,15 +314,17 @@ extern UMidiXbraHandler UMidiSysOldVec;
  * Send one byte per TDRE, disarm TIE the moment the FIFO runs dry --
  * leaving TIE armed with nothing to send would hang the midikey loop. */
 void UMidiAciaHook(void) {
-	if (s_tie && (UMIDI_ACIA_CTRL & UMIDI_ACIA_TDRE)) {
-		if (s_fifoHead != s_fifoTail) {
-			UMIDI_ACIA_DATA = s_fifo[s_fifoTail];
-			s_fifoTail = (s_fifoTail + 1) & UMIDI_FIFO_MASK;
+	UMidiContext *ctx = UMidiActiveContext;
+
+	if (ctx->tie && (UMIDI_ACIA_CTRL & UMIDI_ACIA_TDRE)) {
+		if (ctx->fifoHead != ctx->fifoTail) {
+			UMIDI_ACIA_DATA = ctx->fifo[ctx->fifoTail];
+			ctx->fifoTail = (ctx->fifoTail + 1) & UMIDI_FIFO_MASK;
 		} else {
 			/* nothing to send: disable the ACIA transmit interrupt,
 			 * UMidiTimerHandler() enables it again */
 			UMIDI_ACIA_CTRL = UMIDI_ACIA_CTRL_TIE_OFF;
-			s_tie = SDL_FALSE;
+			ctx->tie = SDL_FALSE;
 		}
 	}
 }
@@ -352,18 +360,19 @@ __asm__(
 	"\n");
 
 static long UMidiInstallHooks(void) {
+	UMidiContext *ctx = UMidiActiveContext;
 	Uint16 sr = UMidiDisableInterrupts();
 
-	s_oldTbcr = UMIDI_MFP_TBCR;
-	s_oldTimerbEnabled	= (UMIDI_MFP_IERA & (1 << 0)) != 0;
-	s_oldTimerbMasked	= (UMIDI_MFP_IMRA & (1 << 0)) != 0;
+	ctx->oldTbcr = UMIDI_MFP_TBCR;
+	ctx->oldTimerbEnabled	= (UMIDI_MFP_IERA & (1 << 0)) != 0;
+	ctx->oldTimerbMasked	= (UMIDI_MFP_IMRA & (1 << 0)) != 0;
 
-	s_tie = SDL_FALSE;
+	ctx->tie = SDL_FALSE;
 	UMIDI_ACIA_CTRL = UMIDI_ACIA_CTRL_TIE_OFF;
 
-	if ((UMidiXbraHandler)s_kbdvecs->midisys != UMidiSysHandler) {
-		UMidiSysOldVec = (UMidiXbraHandler)s_kbdvecs->midisys;
-		s_kbdvecs->midisys = (long (*)(void))UMidiSysHandler;
+	if ((UMidiXbraHandler)ctx->kbdvecs->midisys != UMidiSysHandler) {
+		UMidiSysOldVec = (UMidiXbraHandler)ctx->kbdvecs->midisys;
+		ctx->kbdvecs->midisys = (long (*)(void))UMidiSysHandler;
 	}
 
 	UMidiRestoreInterrupts(sr);
@@ -378,13 +387,14 @@ static void UMidiSendPolled(Uint8 b) {
 }
 
 static long UMidiRemoveHooks(void) {
+	UMidiContext *ctx = UMidiActiveContext;
 	Uint16 sr;
 	int i;
 
 	/* order matters: hardware TIE off first, only then the shadow */
 	sr = UMidiDisableInterrupts();
 	UMIDI_ACIA_CTRL = UMIDI_ACIA_CTRL_TIE_OFF;
-	s_tie = SDL_FALSE;
+	ctx->tie = SDL_FALSE;
 	UMidiRestoreInterrupts(sr);
 
 	/* Silence every channel (TIE is off, so polled sending cannot race
@@ -402,13 +412,13 @@ static long UMidiRemoveHooks(void) {
 
 	sr = UMidiDisableInterrupts();
 
-	Atari_UnhookXbra((Uint32)&s_kbdvecs->midisys, UMIDI_XBRA_ID, UMidiSysHandler);
+	Atari_UnhookXbra((Uint32)&ctx->kbdvecs->midisys, UMIDI_XBRA_ID, UMidiSysHandler);
 
-	UMIDI_MFP_TBCR = s_oldTbcr;
+	UMIDI_MFP_TBCR = ctx->oldTbcr;
 	UMIDI_MFP_IPRA = (Uint8)~(1 << 0);	/* discard a pending tick of ours */
-	if (s_oldTimerbEnabled)
+	if (ctx->oldTimerbEnabled)
 		UMIDI_MFP_IERA |= 1 << 0;
-	if (s_oldTimerbMasked)
+	if (ctx->oldTimerbMasked)
 		UMIDI_MFP_IMRA |= 1 << 0;
 
 	UMidiRestoreInterrupts(sr);
@@ -416,59 +426,69 @@ static long UMidiRemoveHooks(void) {
 	return 0;
 }
 
+static UMidiContext s_ctx = { .volume = MIX_MAX_VOLUME };
+
 void native_midi_start(NativeMidiSong *song, int loops) {
+	UMidiContext *ctx = &s_ctx;
 	int i;
 
 	printf("%s: %d\n", __FUNCTION__, loops);
 
-	if (s_currentSong)
+	if (ctx->currentSong)
 		native_midi_stop();
 
-	s_events = song->firstEvent;
-	s_ticksPerQuarterNote = song->ticksPerQuarterNote;
+	ctx->events = song->firstEvent;
+	ctx->ticksPerQuarterNote = song->ticksPerQuarterNote;
 
-	s_tickAdd		= UMidiTicksPerPeriod(UMIDI_DEFAULT_TEMPO);
-	s_tickFrac		= 0;
-	s_tickInt		= 0;
-	s_fifoHead		= s_fifoTail = 0;
+	ctx->tickAdd	= UMidiTicksPerPeriod(ctx, UMIDI_DEFAULT_TEMPO);
+	ctx->tickFrac	= 0;
+	ctx->tickInt	= 0;
+	ctx->fifoHead	= ctx->fifoTail = 0;
 
 	for (i = 0; i < 16; ++i)
-		s_lastCC7[i] = UMIDI_DEFAULT_CC7;
-	s_volDirty = SDL_TRUE;		/* apply the master volume from the start */
+		ctx->lastCC7[i] = UMIDI_DEFAULT_CC7;
+	ctx->volDirty = SDL_TRUE;	/* apply the master volume from the start */
 
-	s_kbdvecs = Kbdvbase();
+	ctx->kbdvecs = Kbdvbase();
+	UMidiActiveContext = ctx;
 	Supexec(UMidiInstallHooks);
 
-	s_loops = loops;	/* number of repeats after the first pass; -1 = forever */
+	ctx->loops = loops;	/* number of repeats after the first pass; -1 = forever */
 
-	s_currentSong = song;
+	ctx->currentSong = song;
 
 	Jdisint(MFP_TIMERB);
-	s_oldTimerbVec = (Uint32)Setexc(0x120>>2, -1);
+	ctx->oldTimerbVec = (Uint32)Setexc(0x120>>2, -1);
 	Xbtimer(XB_TIMERB, UMIDI_TIMER_B_CTRL, UMIDI_TIMER_B_DATA, UMidiTimerHandler);
 }
 
 void native_midi_stop() {
+	UMidiContext *ctx = &s_ctx;
+
 	printf("%s\n", __FUNCTION__);
 
 	Jdisint(MFP_TIMERB);
-	if (s_oldTimerbVec) {
-		(void)Setexc(0x120>>2, s_oldTimerbVec);
-		s_oldTimerbVec = 0;
+	if (ctx->oldTimerbVec) {
+		(void)Setexc(0x120>>2, ctx->oldTimerbVec);
+		ctx->oldTimerbVec = 0;
 	}
 
-	if (s_kbdvecs)
+	if (ctx->kbdvecs)
 		Supexec(UMidiRemoveHooks);
 
-	s_currentSong = NULL;
+	ctx->currentSong = NULL;
 }
 
 int native_midi_active() {
-	return s_currentSong != NULL
-		&& (s_events || s_fifoHead != s_fifoTail);
+	UMidiContext *ctx = &s_ctx;
+
+	return ctx->currentSong != NULL
+		&& (ctx->events || ctx->fifoHead != ctx->fifoTail);
 }
 
 void native_midi_setvolume(int volume) {
+	UMidiContext *ctx = &s_ctx;
+
 	printf("%s: %d\n", __FUNCTION__, volume);
 
 	if (volume < 0)
@@ -476,8 +496,8 @@ void native_midi_setvolume(int volume) {
 	else if (volume > MIX_MAX_VOLUME)
 		volume = MIX_MAX_VOLUME;
 
-	s_volume = volume;
-	s_volDirty = SDL_TRUE;
+	ctx->volume = volume;
+	ctx->volDirty = SDL_TRUE;
 }
 
 int native_midi_detect() {
@@ -505,12 +525,14 @@ NativeMidiSong *native_midi_loadsong_RW(SDL_RWops *rw, int freerw) {
 }
 
 void native_midi_freesong(NativeMidiSong *song) {
+	UMidiContext *ctx = &s_ctx;
+
 	printf("%s\n", __FUNCTION__);
 
 	if (!song)
 		return;
 
-	if (song == s_currentSong)
+	if (song == ctx->currentSong)
 		native_midi_stop();
 
 	FreeMIDIEventList(song->firstEvent);
