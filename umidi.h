@@ -130,7 +130,8 @@ UMIDI_DEF void UMidiUnlock(UMidiContext* ctx);
  *
  * 2. The MIDI ACIA transmit interrupt is the CONSUMER, draining the
  *    FIFO at wire speed (31250 baud / 10 bits = 3125 bytes/s), one
- *    interrupt per byte and none when idle. Both ACIAs share MFP GPIP
+ *    interrupt per byte after the first ones of a burst, which the timer
+ *    sends itself, and none when idle. Both ACIAs share MFP GPIP
  *    I4 (channel 6, vector $118); the TOS handler ("midikey") loops
  *    calling kb_midisys and kb_ikbdsys until the interrupt line is
  *    released, so we hook kb_midisys via Kbdvbase() and chain the
@@ -241,18 +242,25 @@ static __inline__ int UMidiSongEnded(const UMidiContext *ctx) {
 		&& (!ctx->loops || ctx->song->loopBlock >= ctx->song->numBlocks);
 }
 
-/* End of a Timer B interrupt: arm the ACIA TX interrupt for queued bytes,
- * or disable the Timer B interrupt once there is nothing left to do */
+/* End of a Timer B interrupt: send the first bytes of a burst, arm the
+ * ACIA TX interrupt for the rest, or disable the Timer B interrupt once
+ * there is nothing left to do */
 static __inline__ void UMidiTransmit(UMidiContext *ctx, int idle) {
-	if (ctx->fifoHead != ctx->fifoTail) {
-		/* bytes queued and TX interrupt not armed: arm it. If TDRE is
-		 * already set this asserts the ACIA IRQ at once (falling edge on
-		 * GPIP I4), so transmission starts right after we return. */
-		if (!ctx->tie) {
+	if (!ctx->tie) {
+		/* with the TX interrupt off nothing else takes bytes from the
+		 * FIFO: send directly while the transmit register is empty */
+		while (ctx->fifoHead != ctx->fifoTail && (UMIDI_ACIA_CTRL & UMIDI_ACIA_TDRE)) {
+			UMIDI_ACIA_DATA = ctx->fifo[ctx->fifoTail];
+			ctx->fifoTail = (ctx->fifoTail + 1) & UMIDI_FIFO_MASK;
+		}
+		/* the rest goes out through the TX interrupt, which comes as
+		 * soon as the transmit register is empty again */
+		if (ctx->fifoHead != ctx->fifoTail) {
 			ctx->tie = 1;
 			UMIDI_ACIA_CTRL = UMIDI_ACIA_CTRL_TIE_ON;
 		}
-	} else if (idle) {
+	}
+	if (ctx->fifoHead == ctx->fifoTail && idle) {
 		/* nothing to send and nothing to do: disable the Timer B
 		 * interrupt; UMidiPlay(), UMidiStartTicks() and UMidiSend()
 		 * enable it again */
