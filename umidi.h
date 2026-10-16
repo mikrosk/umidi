@@ -37,7 +37,11 @@
 #define UMIDI_FIFO_MASK			(UMIDI_FIFO_SIZE - 1)
 
 /* timer periods per second, the unit of block times */
+#ifdef __mcoldfire__
+#define UMIDI_TIMER_HZ 3840
+#else
 #define UMIDI_TIMER_HZ 960
+#endif
 
 /* MIDI messages to be sent at the same time */
 typedef struct {
@@ -141,6 +145,14 @@ UMIDI_DEF void UMidiUnlock(UMidiContext* ctx);
  *    it, the midikey loop would hang the machine. The hook therefore
  *    always either sends a byte or turns TIE off before returning.
  *
+ * On the FireBee the transmit interrupt is not used: its FPGA ACIA takes
+ * the data of a register write one clock cycle late, so a control register
+ * write first latches stale bus data, which can select master reset and
+ * abort the byte being transmitted, i.e. the last byte of every burst.
+ * Timer B runs at 3840 Hz there, faster than the ACIA sends bytes, and
+ * while bytes are queued it refills the data register whenever it is
+ * empty.
+ *
  * Volume: a MIDI song controls 16 channel volumes (controller 7) but
  * the wire has no master volume, so UMidiSetVolume() implements one by
  * scaling. lastCC7[] holds each channel volume as the song last set
@@ -166,14 +178,22 @@ UMIDI_DEF void UMidiUnlock(UMidiContext* ctx);
 #define UMIDI_MFP_CLOCK			2457600UL
 #define UMIDI_TIMER_B_CTRL		3		/* prescaler /16 */
 #define UMIDI_TIMER_B_PRESCALER	16
+#ifdef __mcoldfire__
+#define UMIDI_TIMER_B_DATA		40		/* 2457600/16/40 = 3840 Hz */
+#else
 #define UMIDI_TIMER_B_DATA		160		/* 2457600/16/160 = 960 Hz */
+#endif
 #if UMIDI_TIMER_HZ * UMIDI_TIMER_B_PRESCALER * UMIDI_TIMER_B_DATA != UMIDI_MFP_CLOCK
 #error "UMIDI_TIMER_HZ doesn't match the Timer B rate"
 #endif
 
 /* ticks per minute to ticks per timer period, 16.16 fixed point:
  * 65536 * prescaler * data / (60 * MFP clock), reduced to fit in 32 bits */
+#ifdef __mcoldfire__
+#define UMIDI_TICK_MUL			64
+#else
 #define UMIDI_TICK_MUL			256
+#endif
 #define UMIDI_TICK_DIV			225
 #if UMIDI_TICK_MUL * 60 * UMIDI_MFP_CLOCK \
 	!= UMIDI_TICK_DIV * 65536 * UMIDI_TIMER_B_PRESCALER * UMIDI_TIMER_B_DATA
@@ -243,8 +263,8 @@ static __inline__ int UMidiSongEnded(const UMidiContext *ctx) {
 }
 
 /* End of a Timer B interrupt: send the first bytes of a burst, arm the
- * ACIA TX interrupt for the rest, or disable the Timer B interrupt once
- * there is nothing left to do */
+ * ACIA TX interrupt for the rest (on the FireBee the timer sends them all),
+ * or disable the Timer B interrupt once there is nothing left to do */
 static __inline__ void UMidiTransmit(UMidiContext *ctx, int idle) {
 	if (!ctx->tie) {
 		/* with the TX interrupt off nothing else takes bytes from the
@@ -253,12 +273,14 @@ static __inline__ void UMidiTransmit(UMidiContext *ctx, int idle) {
 			UMIDI_ACIA_DATA = ctx->fifo[ctx->fifoTail];
 			ctx->fifoTail = (ctx->fifoTail + 1) & UMIDI_FIFO_MASK;
 		}
+#ifndef __mcoldfire__
 		/* the rest goes out through the TX interrupt, which comes as
 		 * soon as the transmit register is empty again */
 		if (ctx->fifoHead != ctx->fifoTail) {
 			ctx->tie = 1;
 			UMIDI_ACIA_CTRL = UMIDI_ACIA_CTRL_TIE_ON;
 		}
+#endif
 	}
 	if (ctx->fifoHead == ctx->fifoTail && idle) {
 		/* nothing to send and nothing to do: disable the Timer B
@@ -348,6 +370,11 @@ fifo_full:
 
 transmit:
 	UMidiTransmit(ctx, !ctx->song || UMidiSongEnded(ctx));
+#ifdef __mcoldfire__
+	/* the timer sends the queued bytes */
+	if (ctx->fifoHead != ctx->fifoTail)
+		ctx->due = ctx->now + 1;
+#endif
 
 	UMIDI_MFP_ISRA = ~(1 << 0);	/* clear in service bit */
 }
