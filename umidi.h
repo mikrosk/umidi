@@ -101,6 +101,7 @@ UMIDI_DEF void UMidiPlay(UMidiContext* ctx, const UMidiSong* song, int loops);
 UMIDI_DEF void UMidiStop(UMidiContext* ctx);
 UMIDI_DEF int UMidiIsPlaying(const UMidiContext* ctx);
 UMIDI_DEF void UMidiSetVolume(UMidiContext* ctx, int volume);
+UMIDI_DEF uint32_t UMidiPeriods(uint32_t microseconds);
 UMIDI_DEF void UMidiStartTicks(UMidiContext* ctx, void (*callback)(void));
 UMIDI_DEF void UMidiSetTickRate(UMidiContext* ctx, uint32_t ticksPerMinute);
 UMIDI_DEF void UMidiStopTicks(UMidiContext* ctx);
@@ -729,6 +730,11 @@ UMIDI_DEF void UMidiSetVolume(UMidiContext* ctx, int volume) {
 	ctx->volume = volume;
 	ctx->volDirty = 1;
 	ctx->due = 0;
+}
+
+UMIDI_DEF uint32_t UMidiPeriods(uint32_t microseconds) {
+	return microseconds / 1000000 * UMIDI_TIMER_HZ
+		+ (microseconds % 1000000 * UMIDI_TIMER_HZ + 999999) / 1000000;
 }
 
 UMIDI_DEF void UMidiStartTicks(UMidiContext* ctx, void (*callback)(void)) {
