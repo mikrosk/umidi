@@ -13,7 +13,7 @@ typedef struct {
 	const UMidiBlock* blocks;	/* sorted by time */
 	const uint8_t* data;		/* messages of all blocks */
 	uint32_t numBlocks;
-	uint32_t loopBlock;			/* block the repeats start at */
+	uint32_t loopBlock;		/* block the repeats start at */
 } UMidiSong;
 
 typedef struct {
