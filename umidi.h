@@ -294,10 +294,34 @@ static __inline__ void UMidiTransmit(UMidiContext *ctx, int idle) {
 	}
 }
 
+#if defined(__HAVE_68881__)
+#define UMIDI_INTERRUPT_ENTRY(entry, handler) \
+static void __attribute__((__interrupt__, __no_instrument_function__, __optimize__("omit-frame-pointer"))) entry(void) { \
+	__asm__ volatile ( \
+		"\n" "	fsave	-(%%sp)" \
+		"\n" "	fmovem.x	%%fp0-%%fp2,-(%%sp)" \
+		"\n" "	fmovem.l	%%fpcr/%%fpsr/%%fpiar,-(%%sp)" \
+		"\n" "	movem.l	%%d0-%%d2/%%a0-%%a1,-(%%sp)" \
+		"\n" "	jsr		%c[func]" \
+		"\n" "	movem.l	(%%sp)+,%%d0-%%d2/%%a0-%%a1" \
+		"\n" "	fmovem.l	(%%sp)+,%%fpcr/%%fpsr/%%fpiar" \
+		"\n" "	fmovem.x	(%%sp)+,%%fp0-%%fp2" \
+		"\n" "	frestore	(%%sp)+" \
+		: \
+		: [func] "i" (handler) \
+		: "cc", "memory"); \
+}
+#else
+#define UMIDI_INTERRUPT_ENTRY(entry, handler) \
+static void __attribute__((__interrupt__)) entry(void) { \
+	handler(); \
+}
+#endif
+
 /* Producer, once due: queue the messages of the due blocks into the FIFO,
  * arm the ACIA TX interrupt and set the song position at which it runs
  * again */
-static void __attribute__((interrupt)) UMidiPlayerHandler(void) {
+static void UMidiPlayerTick(void) {
 	UMidiContext *ctx = UMidiActiveContext;
 	const UMidiSong *song = ctx->song;
 	int looped = 0;
@@ -388,6 +412,8 @@ transmit:
 	UMIDI_MFP_ISRA = ~(1 << 0);	/* clear in service bit */
 }
 
+UMIDI_INTERRUPT_ENTRY(UMidiPlayerHandler, UMidiPlayerTick)
+
 /* Player's Timer B interrupt: advances the song position and checks whether
  * the handler is due, saving only d0 and a0, so most periods end right here.
  * Otherwise it jumps to UMidiPlayerHandler(), which returns from the
@@ -419,7 +445,7 @@ static void __attribute__((__interrupt__, __no_instrument_function__, __optimize
 
 /* Producer for the application's sequencer: calls it once per MIDI tick and
  * arms the ACIA TX interrupt */
-static void __attribute__((interrupt)) UMidiTickInterrupt(void) {
+static void UMidiTickProducer(void) {
 	UMidiContext *ctx = UMidiActiveContext;
 
 	/* time stands still until the data queued before the callback is
@@ -442,6 +468,8 @@ static void __attribute__((interrupt)) UMidiTickInterrupt(void) {
 
 	UMIDI_MFP_ISRA = ~(1 << 0);	/* clear in service bit */
 }
+
+UMIDI_INTERRUPT_ENTRY(UMidiTickInterrupt, UMidiTickProducer)
 
 #define UMIDI_XBRA_MAGIC		0x58425241L		/* 'XBRA' */
 #define UMIDI_XBRA_ID			0x754D4944L		/* 'uMID' */
